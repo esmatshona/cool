@@ -72,7 +72,7 @@
   const views = document.querySelectorAll('.view');
   const navItems = document.querySelectorAll('.nav-item[data-view]');
   const viewTitle = document.getElementById('viewTitle');
-  const titleKeys = { dashboard: 'nav_dashboard', inbounds: 'nav_inbounds', traffic: 'nav_traffic', plans: 'nav_plans', servers: 'nav_servers', map: 'nav_map', compare: 'nav_compare', alerts: 'nav_alerts', analytics: 'nav_analytics', live: 'nav_live', notifications: 'nav_notifications', shop: 'nav_shop', ai: 'nav_ai', extensions: 'nav_extensions', diagnostics: 'nav_diagnostics', xray: 'nav_xray', telegram: 'nav_telegram', api: 'nav_api', backup: 'nav_backup', logs: 'nav_logs', security: 'nav_security', settings: 'nav_settings' };
+  const titleKeys = { dashboard: 'nav_dashboard', inbounds: 'nav_inbounds', traffic: 'nav_traffic', plans: 'nav_plans', servers: 'nav_servers', protools: 'nav_protools', map: 'nav_map', compare: 'nav_compare', alerts: 'nav_alerts', analytics: 'nav_analytics', live: 'nav_live', notifications: 'nav_notifications', shop: 'nav_shop', ai: 'nav_ai', extensions: 'nav_extensions', diagnostics: 'nav_diagnostics', xray: 'nav_xray', telegram: 'nav_telegram', api: 'nav_api', backup: 'nav_backup', logs: 'nav_logs', security: 'nav_security', settings: 'nav_settings' };
 
   function showView(name) {
     views.forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
@@ -86,6 +86,7 @@
     if (name === 'logs' && window.PREMIUM) window.PREMIUM.loadAudit();
     if (name === 'plans' && window.PREMIUM) window.PREMIUM.loadPlans();
     if (name === 'servers' && window.PREMIUM) window.PREMIUM.loadServers();
+    if (name === 'protools' && window.PROTOOLS) window.PROTOOLS.load();
     if (name === 'analytics' && window.PREMIUM) window.PREMIUM.loadAnalytics();
     if (name === 'live' && window.PREMIUM) window.PREMIUM.startLive();
     else if (window.PREMIUM) window.PREMIUM.stopLive();
@@ -98,6 +99,8 @@
     if (name === 'alerts' && window.PREMIUM) { window.PREMIUM.loadAlerts(); window.PREMIUM.loadThresholds(); }
     if (name === 'map' && window.PREMIUM) window.PREMIUM.loadMap();
     if (name === 'compare' && window.PREMIUM) window.PREMIUM.loadCompare();
+    if (name === 'monitoring' && window.PREMIUM) window.PREMIUM.loadMonitoring();
+    if (name === 'events' && window.PREMIUM) window.PREMIUM.loadEvents();
     if (name === 'dashboard' && window.PREMIUM) window.PREMIUM.loadMsStrip();
     if (name === 'xray' && window.PREMIUM) window.PREMIUM.loadXray();
     if (name === 'dashboard' && window.PREMIUM) window.PREMIUM.loadSystem();
@@ -527,6 +530,11 @@
     document.getElementById('fMaxReq').value = ib ? (ib.max_requests || '') : '';
     document.getElementById('fFingerprint').value = ib ? (ib.fp || 'chrome') : 'chrome';
     document.getElementById('fStrictIp').checked = ib ? !!ib.strict_single_ip : false;
+    // ---- protocol picker: reflect the user's saved protocols ----
+    const ibProtos = (ib && ib.protocols && ib.protocols.length) ? ib.protocols : ['vless', 'vmess'];
+    document.querySelectorAll('#fProtocols input[type="checkbox"]').forEach(cb => {
+      cb.checked = ibProtos.includes(cb.value);
+    });
     document.getElementById('fNote').value = ib ? (ib.note || '') : '';
     openModal('inboundModal');
   }
@@ -535,6 +543,8 @@
 
   document.getElementById('inboundSaveBtn').addEventListener('click', async () => {
     const uid = document.getElementById('inboundUid').value;
+    const pickedProtos = Array.from(document.querySelectorAll('#fProtocols input[type="checkbox"]:checked')).map(cb => cb.value);
+    if (!pickedProtos.length) { STANNG.toast(STANNG.t('proto_need_one'), 'error'); return; }
     const payload = {
       name: document.getElementById('fName').value.trim() || 'User',
       quota_gb: parseFloat(document.getElementById('fQuota').value || 0),
@@ -543,6 +553,7 @@
       max_requests: parseInt(document.getElementById('fMaxReq').value || 0),
       fp: document.getElementById('fFingerprint').value,
       strict_single_ip: document.getElementById('fStrictIp').checked,
+      protocols: pickedProtos,
       note: document.getElementById('fNote').value.trim(),
     };
     if (!uid) {

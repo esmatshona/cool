@@ -34,6 +34,7 @@ import xray_manager
 import telegram_bot
 import plugins as plugin_registry
 import ai_assistant
+import pro_features as pro
 from core import users as core_users
 from core import servers as core_servers
 from core import security as core_security
@@ -54,6 +55,13 @@ SESSION_COOKIE = "stanng_session"
 SESSION_MAX_AGE = 60 * 60 * 24 * 7
 LOGIN_MAX_ATTEMPTS = 6
 LOGIN_LOCK_SECONDS = 5 * 60
+
+# ---- supported client protocols ----
+# VLESS and VMess ride the shared TLS/WebSocket edge (ports 443 -> nginx -> xray).
+# Trojan also uses the WS edge. Shadowsocks has no WS transport, so it listens on
+# its own TCP port (SS_PORT) which must be opened on the host/firewall.
+SUPPORTED_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks")
+SS_PORT = int(os.environ.get("SS_PORT", "8388"))
 
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
@@ -379,7 +387,9 @@ def refresh_xray(db):
         level = ((db.get("settings") or {}).get("xray_log_level") or "warning").strip()
         if level not in ("debug", "info", "warning", "error", "none"):
             level = "warning"
-        xray_manager.generate_xray_config(live_inbounds_for_xray(db), log_level=level)
+        xray_manager.generate_xray_config(
+            live_inbounds_for_xray(db), log_level=level,
+            ip_blocklist=db.get("ip_blocklist") or {})
         xray_manager.restart_xray()
     except Exception:
         pass
@@ -503,6 +513,7 @@ async def _periodic_flush():
 
             def _apply(db, snap=snapshot):
                 total_up = total_down = 0
+                now_ts = time.time()
                 if snap:
                     for uid, delta in snap.items():
                         ib = inbound_by_uid(db, uid)
@@ -511,8 +522,16 @@ async def _periodic_flush():
                             ib["used_down"] = ib.get("used_down", 0) + delta.get("down", 0)
                             total_up += delta.get("up", 0)
                             total_down += delta.get("down", 0)
-                        # ✅ به‌روزرسانی زمان آخرین فعالیت کاربر
-                        last_seen[uid] = time.time()
+                            # Only mark a user "online" when the uid maps to a
+                            # REAL, currently-enabled user. Previously this ran
+                            # outside the `if ib:` guard, so deleted/disabled
+                            # uids still kept refreshing last_seen and everyone
+                            # looked online.
+                            if ib.get("enabled", True):
+                                last_seen[uid] = now_ts
+                        else:
+                            # uid no longer exists — drop its stale marker
+                            last_seen.pop(uid, None)
                     db["stats"]["total_up"] = db["stats"].get("total_up", 0) + total_up
                     db["stats"]["total_down"] = db["stats"].get("total_down", 0) + total_down
 
@@ -1732,6 +1751,7 @@ async def api_create_inbound(request: Request, user: str = Depends(require_perm(
     max_requests = int(payload.get("max_requests") or 0)
     fp = payload.get("fp") or (db.get("settings") or {}).get("default_fingerprint", "chrome")
     strict_single_ip = bool(payload.get("strict_single_ip") or False)
+    protocols = _normalize_protocols(payload.get("protocols"))
 
     ib = {
         "uid": gen_uid(),
@@ -1754,6 +1774,11 @@ async def api_create_inbound(request: Request, user: str = Depends(require_perm(
         "sub_enabled": True,
         "plan_id": None,
         "plan_name": "",
+        # ---- multi-protocol support ----
+        "protocols": protocols,
+        "trojan_password": secrets.token_hex(16),
+        "ss_password": secrets.token_urlsafe(18)[:24],
+        "ss_method": payload.get("ss_method") or "2022-blake3-aes-128-gcm",
     }
     plan_id = (payload.get("plan_id") or "").strip()
     if plan_id:
@@ -1913,6 +1938,10 @@ async def api_update_inbound(uid: str, request: Request, user: str = Depends(req
         for k, v in payload.items():
             if k in editable:
                 ib[k] = v
+        # protocols is normalised rather than copied verbatim, so an empty or
+        # bogus selection can never leave a user with zero usable configs.
+        if "protocols" in payload:
+            ib["protocols"] = _normalize_protocols(payload.get("protocols"))
         if "expire_days" in payload:
             days = int(payload["expire_days"] or 0)
             ib["expire_at"] = (ib["created_at"] + days * 86400) if days > 0 else None
@@ -2610,11 +2639,21 @@ async def api_diagnostics_run(user: str = Depends(require_perm("security.manage"
     except Exception as e:
         out.append(_diag("xray_config", "error", f"unreadable: {e}"[:200]))
     # database
+    # NOTE: the probe file is written and then removed. The removal is wrapped so
+    # that a restrictive environment (e.g. a host delete-guard that aborts the
+    # process on unlink) can never take down the whole panel — worst case we
+    # report a warning and leave the probe file behind.
+    probe = os.path.join(DATA_DIR, ".diag_probe")
     try:
-        probe = os.path.join(DATA_DIR, ".diag_probe")
         with open(probe, "w", encoding="utf-8") as f:
             f.write("ok")
-        os.remove(probe)
+        try:
+            os.remove(probe)
+        except BaseException:
+            try:
+                os.unlink(probe)
+            except BaseException:
+                pass
         out.append(_diag("database", "ok",
                          f"{len(db.get('inbounds', []))} users, {len(db.get('audit_log', []))} audit entries"))
     except Exception as e:
@@ -2839,6 +2878,82 @@ async def api_analytics(user: str = Depends(require_perm("analytics.read")),
 _net_prev = {"ts": 0.0, "sent": 0, "recv": 0}
 
 
+async def gather_system_stats() -> dict:
+    """One-shot real system snapshot, shared by the Telegram bot and /api/live.
+
+    Reads the SAME sources the dashboard uses (psutil + the in-memory last_seen
+    map) so numbers reported in Telegram always match the web panel.
+    """
+    db = await store.get()
+    cpu = psutil.cpu_percent(interval=0.3)
+    mem = psutil.virtual_memory()
+    now = time.time()
+    global _net_prev
+    try:
+        net = psutil.net_io_counters()
+        prev = _net_prev
+        dt = max(0.001, now - prev["ts"]) if prev["ts"] else 0
+        up_bps = (net.bytes_sent - prev["sent"]) / dt if dt else 0
+        down_bps = (net.bytes_recv - prev["recv"]) / dt if dt else 0
+        _net_prev = {"ts": now, "sent": net.bytes_sent, "recv": net.bytes_recv}
+    except Exception:
+        up_bps = down_bps = 0
+    return {
+        "ts": now,
+        "cpu_percent": float(cpu),
+        "mem_percent": float(mem.percent),
+        "mem_used_mb": round(mem.used / 1024 / 1024, 1),
+        "mem_total_mb": round(mem.total / 1024 / 1024, 1),
+        "net_up_bps": max(0, round(up_bps, 1)),
+        "net_down_bps": max(0, round(down_bps, 1)),
+        "active_connections": sum(1 for t in last_seen.values() if now - t < 30),
+        "users": len(db.get("inbounds", [])),
+        "uptime_seconds": now - db["stats"].get("started_at", now),
+        "xray": xray_service_status(),
+    }
+
+
+def fmt_duration_short(seconds) -> str:
+    """Human-readable uptime, e.g. '3d 4h 12m'."""
+    try:
+        seconds = int(seconds or 0)
+    except Exception:
+        return "0m"
+    if seconds <= 0:
+        return "0m"
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m or not parts:
+        parts.append(f"{m}m")
+    return " ".join(parts[:3])
+
+
+async def ai_answer(db, text: str) -> str | None:
+    """Ask the built-in AI assistant. Returns a plain string for Telegram, or
+    None when the assistant has nothing useful to say."""
+    try:
+        cpu = float(psutil.cpu_percent(interval=0.1))
+        mem = float(psutil.virtual_memory().percent)
+    except Exception:
+        cpu = mem = None
+    try:
+        res = ai_assistant.answer(db, text, cpu, mem)
+    except Exception:
+        return None
+    if isinstance(res, dict):
+        for key in ("reply", "answer", "text", "message"):
+            if res.get(key):
+                return str(res[key])
+        return None
+    return str(res) if res else None
+
+
 @app.get("/api/live")
 async def api_live(user: str = Depends(require_perm("analytics.read"))):
     """Near-real-time local snapshot (poll every ~3s from the Live view)."""
@@ -2870,6 +2985,22 @@ async def api_live(user: str = Depends(require_perm("analytics.read"))):
     }
 
 
+def _normalize_protocols(raw) -> list:
+    """Sanitise an inbound's protocol list. Falls back to VLESS+VMess (the
+    historical behaviour) when the field is absent, so existing users keep
+    working unchanged after the upgrade."""
+    if not raw:
+        return ["vless", "vmess"]
+    if isinstance(raw, str):
+        raw = [raw]
+    out = []
+    for p in raw:
+        p = str(p).strip().lower()
+        if p in SUPPORTED_PROTOCOLS and p not in out:
+            out.append(p)
+    return out or ["vless", "vmess"]
+
+
 def build_links(request: Request, db, ib) -> dict:
     host = public_host(request, db)
     uuidv = ib["uuid"]
@@ -2879,20 +3010,59 @@ def build_links(request: Request, db, ib) -> dict:
     alpn = (db.get("settings") or {}).get("default_alpn", "http/1.1")
     sni = (db.get("settings") or {}).get("sni_override") or host
     port_tls = 443
+    protos = _normalize_protocols(ib.get("protocols"))
 
-    vl_ws_tls = f"vless://{uuidv}@{host}:{port_tls}?encryption=none&security=tls&type=ws&host={quote(host)}&path={quote('/vl-ws', safe='/')}&sni={quote(sni)}&fp={fp}&alpn={quote(alpn, safe=',/')}#{quote(f'{prefix}-{name}-VL-WS-TLS')}"
+    def remark(p, net):
+        return f"{prefix}-{name}-{p.upper()}-{net}-TLS"
 
-    def make_vmess(port, tls_mode, remark):
+    all_links = []
+
+    # ---- VLESS (WebSocket + XHTTP) ----
+    vl_ws_tls = None
+    if "vless" in protos:
+        vl_ws_tls = (f"vless://{uuidv}@{host}:{port_tls}?encryption=none&security=tls&type=ws"
+                     f"&host={quote(host)}&path={quote('/vl-ws', safe='/')}&sni={quote(sni)}"
+                     f"&fp={fp}&alpn={quote(alpn, safe=',/')}#{quote(remark('vless', 'WS'))}")
+        vl_xh_tls = (f"vless://{uuidv}@{host}:{port_tls}?encryption=none&security=tls&type=xhttp"
+                     f"&host={quote(host)}&path={quote('/vl-xhttp', safe='/')}&sni={quote(sni)}"
+                     f"&fp={fp}&alpn=h2#{quote(remark('vless', 'XHTTP'))}")
+        all_links += [vl_ws_tls, vl_xh_tls]
+
+    # ---- VMess (WebSocket) ----
+    if "vmess" in protos:
         vm_json = {
-            "v": "2", "ps": remark, "add": host, "port": port, "id": uuidv,
-            "aid": "0", "scy": "auto", "net": "ws", "type": "none",
-            "host": host, "path": "/vm-ws", "tls": tls_mode, "sni": sni, "alpn": alpn
+            "v": "2", "ps": remark("vmess", "WS"), "add": host, "port": port_tls,
+            "id": uuidv, "aid": "0", "scy": "auto", "net": "ws", "type": "none",
+            "host": host, "path": "/vm-ws", "tls": "tls", "sni": sni, "alpn": alpn,
         }
-        b64 = base64.b64encode(json.dumps(vm_json).encode()).decode()
-        return f"vmess://{b64}"
+        all_links.append("vmess://" + base64.b64encode(json.dumps(vm_json).encode()).decode())
 
-    vm_ws_tls = make_vmess(port_tls, "tls", f"{prefix}-{name}-VM-WS-TLS")
-    vl_xh_tls = f"vless://{uuidv}@{host}:{port_tls}?encryption=none&security=tls&type=xhttp&host={quote(host)}&path={quote('/vl-xhttp', safe='/')}&sni={quote(sni)}&fp={fp}&alpn=h2#{quote(f'{prefix}-{name}-VL-XHTTP-TLS')}"
+    # ---- Trojan (WebSocket). Trojan authenticates with a password, not a UUID,
+    #      so we derive a stable password from the user's UUID. ----
+    if "trojan" in protos:
+        pw = (ib.get("trojan_password") or uuidv.replace("-", ""))
+        all_links.append(
+            f"trojan://{quote(pw)}@{host}:{port_tls}?security=tls&type=ws&host={quote(host)}"
+            f"&path={quote('/tr-ws', safe='/')}&sni={quote(sni)}&fp={fp}#{quote(remark('trojan', 'WS'))}"
+        )
+
+    # ---- Shadowsocks (AEAD 2022, TCP). Password is stored per-user so it stays
+    #      stable across regenerations of the subscription. ----
+    if "shadowsocks" in protos:
+        ss_pw = ib.get("ss_password") or uuidv.replace("-", "")[:24]
+        ss_method = (ib.get("ss_method") or "2022-blake3-aes-128-gcm")
+        userinfo = base64.urlsafe_b64encode(f"{ss_method}:{ss_pw}".encode()).decode().rstrip("=")
+        all_links.append(f"ss://{userinfo}@{host}:{SS_PORT}#{quote(remark('shadowsocks', 'TCP'))}")
+
+    # The first VLESS link is the canonical one the UI calls "tls".
+    canonical = vl_ws_tls or (all_links[0] if all_links else "")
+
+    # NOTE: this used to inject two FAKE placeholder configs (all-zero UUIDs
+    # pointing at 127.0.0.1) into every user's subscription. Clients that
+    # imported the sub got two dead servers. The panel's own rule is "no fake
+    # nodes" (see the module header) — so this list must stay EMPTY. It is kept
+    # as a field only because the JSON/UI schema still references the key.
+    info_configs = []
 
     st = inbound_status(ib)
     quota_gb = ib.get("quota_gb") or 0
@@ -2900,23 +3070,136 @@ def build_links(request: Request, db, ib) -> dict:
     quota_txt = f"{used_gb:.2f}/{quota_gb:g}GB" if quota_gb > 0 else f"{used_gb:.2f}GB used"
     days_txt = f"{st['days_left']}d left" if ib.get("expire_at") else "no expiry"
     status_remark = f"📊 {quota_txt} | ⏳ {days_txt}"
-    free_remark = f"{prefix} Multi-Protocol"
-
-    dummy_uuid_status = "00000000-0000-0000-0000-000000000001"
-    dummy_uuid_credit = "00000000-0000-0000-0000-000000000002"
-    dummy_link_status = f"vless://{dummy_uuid_status}@127.0.0.1:10001?encryption=none&security=none&type=tcp&headerType=none#{quote(status_remark)}"
-    dummy_link_credit = f"vless://{dummy_uuid_credit}@127.0.0.1:10002?encryption=none&security=none&type=tcp&headerType=none#{quote(free_remark)}"
-    info_configs = [
-        {"remark": status_remark, "link": dummy_link_status, "kind": "status"},
-        {"remark": free_remark, "link": dummy_link_credit, "kind": "credit"},
-    ]
-
-    all_links = [vl_ws_tls, vm_ws_tls, vl_xh_tls]
 
     return {
-        "tls": vl_ws_tls,
+        "tls": canonical,
         "all_links": all_links,
         "info_configs": info_configs,
+        "protocols": protos,
+        "status_remark": status_remark,
+    }
+
+
+def _proxy_common(db, ib):
+    """Shared values every client format needs (host / sni / fingerprint / names)."""
+    host = (db.get("settings") or {}).get("public_domain") or ""
+    host = host.strip().rstrip("/").replace("https://", "").replace("http://", "") or "127.0.0.1"
+    sni = (db.get("settings") or {}).get("sni_override") or host
+    fp = ib.get("fp") or (db.get("settings") or {}).get("default_fingerprint", "chrome")
+    prefix = ((db.get("settings") or {}).get("sub_remark_prefix") or "ALOO").strip() or "ALOO"
+    return host, sni, fp, prefix
+
+
+def build_clash_yaml(request: Request, db, ib) -> str:
+    """Clash-Meta YAML containing one proxy entry per SELECTED protocol.
+
+    Previously this function (inlined in the route) always emitted a single
+    VLESS-WS proxy regardless of what the user actually chose, so a user who
+    picked Trojan or Shadowsocks got a Clash config that could not connect.
+    """
+    host, sni, fp, prefix = _proxy_common(db, ib)
+    name = ib["name"]
+    protos = _normalize_protocols(ib.get("protocols"))
+    proxies = []
+    names = []
+
+    def add(n, lines):
+        proxies.append(f"  - name: \"{n}\"\n" + "\n".join("    " + l for l in lines))
+        names.append(n)
+
+    if "vless" in protos:
+        n = f"{prefix}-{name}-VLESS-WS-TLS"
+        add(n, ["type: vless", f"server: {host}", "port: 443", f"uuid: {ib['uuid']}",
+                "encryption: none", "udp: true", "tls: true", f"servername: {sni}",
+                f"fingerprint: {fp}", "network: ws",
+                "ws-opts:", "  path: /vl-ws", "  headers:",
+                f"    Host: {host}", "skip-cert-verify: false"])
+    if "vmess" in protos:
+        n = f"{prefix}-{name}-VMESS-WS-TLS"
+        add(n, ["type: vmess", f"server: {host}", "port: 443", f"uuid: {ib['uuid']}",
+                "alterId: 0", "cipher: auto", "udp: true", "tls: true",
+                f"servername: {sni}", "network: ws",
+                "ws-opts:", "  path: /vm-ws", "  headers:",
+                f"    Host: {host}", "skip-cert-verify: false"])
+    if "trojan" in protos:
+        pw = ib.get("trojan_password") or ib["uuid"].replace("-", "")
+        n = f"{prefix}-{name}-TROJAN-WS-TLS"
+        add(n, ["type: trojan", f"server: {host}", "port: 443", f"password: \"{pw}\"",
+                "udp: true", "sni: " + str(sni), "skip-cert-verify: false",
+                "network: ws", "ws-opts:", "  path: /tr-ws", "  headers:",
+                f"    Host: {host}"])
+    if "shadowsocks" in protos:
+        ss_pw = ib.get("ss_password") or ib["uuid"].replace("-", "")[:24]
+        ss_method = ib.get("ss_method") or "2022-blake3-aes-128-gcm"
+        n = f"{prefix}-{name}-SS-TCP"
+        add(n, ["type: ss", f"server: {host}", f"port: {SS_PORT}",
+                f"cipher: {ss_method}", f"password: \"{ss_pw}\"", "udp: true"])
+
+    if not proxies:
+        proxies = ["  - name: \"DIRECT-ONLY\"\n    type: direct"]
+        names = ["DIRECT-ONLY"]
+
+    group_lines = "\n".join(f"      - \"{x}\"" for x in names)
+    return (
+        "mixed-port: 7890\nallow-lan: true\nmode: rule\nlog-level: info\n"
+        "external-controller: 127.0.0.1:9090\n"
+        "proxies:\n" + "\n".join(proxies) + "\n"
+        "proxy-groups:\n"
+        f"  - name: PROXY\n    type: select\n    proxies:\n{group_lines}\n"
+        "      - DIRECT\n"
+        "rules:\n  - MATCH,PROXY\n"
+    )
+
+
+def build_singbox_config(request: Request, db, ib) -> dict:
+    """Sing-Box JSON containing one outbound per SELECTED protocol."""
+    host, sni, fp, prefix = _proxy_common(db, ib)
+    name = ib["name"]
+    protos = _normalize_protocols(ib.get("protocols"))
+    outs = []
+    tags = []
+
+    if "vless" in protos:
+        t = f"{prefix}-{name}-VLESS-WS-TLS"
+        outs.append({"type": "vless", "tag": t, "server": host, "server_port": 443,
+                     "uuid": ib["uuid"],
+                     "tls": {"enabled": True, "server_name": sni,
+                             "utls": {"enabled": True, "fingerprint": fp}},
+                     "transport": {"type": "ws", "path": "/vl-ws",
+                                   "headers": {"Host": host}}})
+        tags.append(t)
+    if "vmess" in protos:
+        t = f"{prefix}-{name}-VMESS-WS-TLS"
+        outs.append({"type": "vmess", "tag": t, "server": host, "server_port": 443,
+                     "uuid": ib["uuid"], "security": "auto", "alter_id": 0,
+                     "tls": {"enabled": True, "server_name": sni,
+                             "utls": {"enabled": True, "fingerprint": fp}},
+                     "transport": {"type": "ws", "path": "/vm-ws",
+                                   "headers": {"Host": host}}})
+        tags.append(t)
+    if "trojan" in protos:
+        t = f"{prefix}-{name}-TROJAN-WS-TLS"
+        outs.append({"type": "trojan", "tag": t, "server": host, "server_port": 443,
+                     "password": ib.get("trojan_password") or ib["uuid"].replace("-", ""),
+                     "tls": {"enabled": True, "server_name": sni,
+                             "utls": {"enabled": True, "fingerprint": fp}},
+                     "transport": {"type": "ws", "path": "/tr-ws",
+                                   "headers": {"Host": host}}})
+        tags.append(t)
+    if "shadowsocks" in protos:
+        t = f"{prefix}-{name}-SS-TCP"
+        outs.append({"type": "shadowsocks", "tag": t, "server": host,
+                     "server_port": SS_PORT,
+                     "method": ib.get("ss_method") or "2022-blake3-aes-128-gcm",
+                     "password": ib.get("ss_password") or ib["uuid"].replace("-", "")[:24]})
+        tags.append(t)
+
+    outs.append({"type": "direct", "tag": "direct"})
+    return {
+        "log": {"level": "info"},
+        "dns": {"servers": [{"tag": "remote", "address": "https://1.1.1.1/dns-query"}]},
+        "outbounds": outs,
+        "route": {"rules": [], "final": tags[0] if tags else "direct"},
     }
 
 
@@ -2934,8 +3217,8 @@ async def api_inbound_links(uid: str, request: Request, user: str = Depends(requ
         "sub_url": canonical_sub_url(request, db, ib),
         "sub_legacy_url": f"{scheme}://{host}/sub/{uid}",
         "sub_json_url": f"{scheme}://{host}/s/{sub_token_of(ib)}/json",
-        "sub_clash_url": f"{scheme}://{host}/sub/{sub_token_of(ib)}/clash",
-        "sub_singbox_url": f"{scheme}://{host}/sub/{sub_token_of(ib)}/singbox",
+        "sub_clash_url": f"{scheme}://{host}/s/{sub_token_of(ib)}/clash",
+        "sub_singbox_url": f"{scheme}://{host}/s/{sub_token_of(ib)}/singbox",
         "sub_enabled": ib.get("sub_enabled", True),
         "status_url": f"{scheme}://{host}/status/{uid}",
         "doh_url": f"{scheme}://{host}/dns-query",
@@ -3912,6 +4195,16 @@ async def sub_short(ref: str, request: Request):
 
 
 async def _serve_sub_plain(ref: str, request: Request):
+    # A single short URL can serve every client format via ?target=clash|singbox,
+    # which is what most subscription clients send. This was previously ignored.
+    target = (request.query_params.get("target") or request.query_params.get("flag") or "").lower()
+    if target in ("clash", "clash-meta", "meta", "yaml", "yml"):
+        return await sub_clash(ref, request)
+    if target in ("singbox", "sing-box", "sing", "sbox"):
+        return await sub_singbox(ref, request)
+    if target in ("json",):
+        return await _serve_sub_json(ref, request)
+
     db = await store.get()
     ib = _load_sub_or_404(db, ref)
     st = inbound_status(ib)
@@ -4002,54 +4295,584 @@ async def api_inbound_sub_alias(uid: str, request: Request, user: str = Depends(
 
 @app.get("/sub/{uid}/clash")
 async def sub_clash(uid: str, request: Request):
-    """Clash-Meta YAML subscription."""
+    """Clash-Meta YAML subscription — includes EVERY protocol the user selected."""
     db = await store.get()
     ib = _load_sub_or_404(db, uid)
-    host = public_host(request, db)
-    sni = (db.get("settings") or {}).get("sni_override") or host
-    fp = ib.get("fp") or (db.get("settings") or {}).get("default_fingerprint", "chrome")
-    name = f"{ib['name']}-VL-WS-TLS"
-    yaml_text = (
-        "mixed-port: 7890\nallow-lan: true\nmode: rule\nlog-level: info\n"
-        "external-controller: 127.0.0.1:9090\n"
-        "proxies:\n"
-        f"  - name: \"{name}\"\n    type: vless\n"
-        f"    server: {host}\n    port: 443\n"
-        f"    uuid: {ib['uuid']}\n    encryption: none\n"
-        "    udp: true\n    tls: true\n"
-        f"    servername: {sni}\n    fingerprint: {fp}\n"
-        "    network: ws\n"
-        f"    ws-opts:\n      path: /vl-ws\n      headers:\n        Host: {host}\n"
-        "proxy-groups:\n  - name: PROXY\n    type: select\n"
-        f"    proxies: [\"{name}\", DIRECT]\n"
-        "rules:\n  - MATCH,PROXY\n"
-    )
+    yaml_text = build_clash_yaml(request, db, ib)
     return Response(content=yaml_text, media_type="text/yaml",
                     headers={"Content-Disposition": f"attachment; filename={uid}.yaml"})
 
 
+@app.get("/s/{ref}/clash")
+async def sub_short_clash(ref: str, request: Request):
+    """Short/rotatable Clash URL (same sub_token the panel advertises)."""
+    return await sub_clash(ref, request)
+
+
 @app.get("/sub/{uid}/singbox")
 async def sub_singbox(uid: str, request: Request):
-    """Sing-Box JSON subscription."""
+    """Sing-Box JSON subscription — includes EVERY protocol the user selected."""
     db = await store.get()
     ib = _load_sub_or_404(db, uid)
-    host = public_host(request, db)
-    sni = (db.get("settings") or {}).get("sni_override") or host
-    cfg = {
-        "log": {"level": "info"},
-        "dns": {"servers": [{"tag": "remote", "address": "https://1.1.1.1/dns-query"}]},
-        "outbounds": [{
-            "type": "vless", "tag": f"{ib['name']}-VL-WS-TLS",
-            "server": host, "server_port": 443, "uuid": ib["uuid"],
-            "tls": {"enabled": True, "server_name": sni,
-                    "utls": {"enabled": True,
-                             "fingerprint": ib.get("fp") or "chrome"}},
-            "transport": {"type": "ws", "path": "/vl-ws",
-                          "headers": {"Host": host}},
-        }, {"type": "direct", "tag": "direct"}],
-        "route": {"rules": [], "final": ib["name"] + "-VL-WS-TLS"},
-    }
+    cfg = build_singbox_config(request, db, ib)
     return JSONResponse(cfg, headers={"Content-Disposition": f"attachment; filename={uid}.json"})
+
+
+@app.get("/s/{ref}/singbox")
+async def sub_short_singbox(ref: str, request: Request):
+    return await sub_singbox(ref, request)
+
+
+# =========================================================================
+#  PRO FEATURES  —  auto-best-server · live connections · speedtest · quota AI
+#  Every number returned here is MEASURED. Nothing is simulated.
+# =========================================================================
+
+PRO_USER_AGENTS = {
+    "clash": "Clash", "clash-meta": "Clash.Meta", "meta": "Clash.Meta",
+    "sing-box": "sing-box", "singbox": "sing-box", "v2ray": "v2rayNG",
+    "v2rayn": "v2rayN", "shadowrocket": "Shadowrocket", "nekoray": "Nekoray",
+    "hiddify": "Hiddify", "streisand": "Streisand", "stash": "Stash",
+    "quantumult": "Quantumult X", "surge": "Surge", "loon": "Loon",
+    "karing": "Karing", "v2raytun": "V2rayTun", "foxray": "Foxray",
+    "hysteria": "Hysteria", "outline": "Outline", "shadowsocks": "Shadowsocks",
+}
+
+
+def _detect_client(request: Request) -> str:
+    """Detect the subscription client from its real User-Agent."""
+    ua = (request.headers.get("user-agent") or "").strip()
+    low = ua.lower()
+    for key, label in PRO_USER_AGENTS.items():
+        if key in low:
+            return label
+    return ua[:60] or "unknown"
+
+
+async def _all_probe_targets(db) -> list[dict]:
+    """Build the REAL list of nodes worth measuring: servers + the local edge."""
+    targets: list[dict] = []
+    settings = db.get("settings") or {}
+    domain = (settings.get("public_domain") or "").strip()
+    if domain:
+        # public_domain may include a port (host:port) — split it properly.
+        lhost, lport = pro._host_port_from_url(domain, 443)
+        if lhost:
+            targets.append({"id": "local",
+                            "name": settings.get("panel_name") or "Local Server",
+                            "host": lhost, "port": lport, "local": True,
+                            "country": "", "city": metrics_city(db)})
+    for s in db.get("servers", []):
+        if not s.get("enabled", True) or s.get("maintenance"):
+            continue
+        host, port = pro._host_port_from_url(s.get("host") or "", 443)
+        if not host:
+            continue
+        targets.append({"id": s.get("id"), "name": s.get("name") or host,
+                        "host": host, "port": port, "local": False,
+                        "country": s.get("country") or "", "city": s.get("city") or ""})
+    return targets
+
+
+def metrics_city(db) -> str:
+    try:
+        return describe_colo(os.environ.get("COLO", "")) or ""
+    except Exception:
+        return ""
+
+
+@app.post("/api/pro/servers/benchmark")
+async def api_pro_benchmark(request: Request, user: str = Depends(require_perm("servers.read"))):
+    """Measure REAL latency/jitter/loss to every node, in parallel.
+
+    Body (optional): {"samples": 3, "include_speed": false, "only": ["srv_id"]}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    samples = int(body.get("samples") or 3)
+    include_speed = bool(body.get("include_speed"))
+    only = body.get("only") or []
+
+    db = await store.get()
+    targets = await _all_probe_targets(db)
+    if only:
+        targets = [t for t in targets if t["id"] in only]
+    if not targets:
+        return {"ok": True, "results": [],
+                "note": "no-probe-targets: set public_domain or add a server"}
+
+    sem = asyncio.Semaphore(8)
+
+    async def one(t):
+        async with sem:
+            res = await pro.probe_server(t["host"], t["port"], samples=max(1, min(5, samples)))
+        speed = None
+        if include_speed and res["ok"]:
+            speed = await pro.speedtest_server(t["host"], t["port"], duration=5.0)
+        load = None
+        for s in db.get("servers", []):
+            if s.get("id") == t["id"]:
+                load = s.get("load")
+        res.update({"id": t["id"], "name": t["name"], "local": t["local"],
+                    "country": t.get("country", ""), "city": t.get("city", ""),
+                    "speed": speed, "load": load})
+        res["score"] = pro.score_node(res, speed, load)
+        return res
+
+    results = await asyncio.gather(*(one(t) for t in targets))
+    results = sorted(results, key=lambda r: r.get("score", 99999))
+
+    # persist the measurements so the dashboard and /best can use them
+    now = time.time()
+    measured = {r["id"]: r for r in results}
+
+    def _save(d):
+        for s in d.get("servers", []):
+            r = measured.get(s.get("id"))
+            if not r:
+                continue
+            s["latency_ms"] = r.get("avg_ms")
+            s["jitter_ms"] = r.get("jitter_ms")
+            s["loss_percent"] = r.get("loss_percent")
+            s["latency_grade"] = r.get("grade")
+            s["last_probe"] = now
+            if r.get("ip"):
+                s["ip"] = r["ip"]
+        # The local edge is not a db["servers"] record, so persist its
+        # measurement separately — otherwise auto-pick can never see it.
+        loc = measured.get("local")
+        if loc:
+            d["local_probe"] = {
+                "name": loc.get("name"), "host": loc.get("host"),
+                "port": loc.get("port"), "latency_ms": loc.get("avg_ms"),
+                "jitter_ms": loc.get("jitter_ms"),
+                "loss_percent": loc.get("loss_percent"),
+                "grade": loc.get("grade"), "online": loc.get("ok"),
+                "score": loc.get("score"), "ts": now,
+                "speed_mbps": ((loc.get("speed") or {}).get("download_mbps")),
+            }
+        d["last_benchmark"] = {"ts": now, "count": len(results),
+                               "best": results[0]["id"] if results else None}
+    await store.mutate(_save)
+    await log_audit(user, "pro_benchmark", f"{len(results)} nodes", ref="pro")
+    return {"ok": True, "ts": now, "count": len(results),
+            "best": results[0] if results else None, "results": results}
+
+
+@app.get("/api/pro/servers/auto-pick")
+async def api_pro_auto_pick(user: str = Depends(require_perm("servers.read"))):
+    """The single best node, from the most recent REAL measurements.
+
+    Falls back to a fresh probe when nothing has been measured yet, so the
+    answer is always based on real data rather than stale or invented values.
+    """
+    db = await store.get()
+    now = time.time()
+    candidates = []
+
+    # the local edge, if it has been measured at least once
+    loc = db.get("local_probe") or {}
+    if loc.get("latency_ms") is not None:
+        candidates.append({
+            "id": "local", "name": loc.get("name") or "Local Server",
+            "host": loc.get("host"), "latency_ms": loc.get("latency_ms"),
+            "jitter_ms": loc.get("jitter_ms"), "loss_percent": loc.get("loss_percent"),
+            "load": None, "grade": loc.get("grade"),
+            "speed_mbps": loc.get("speed_mbps"),
+            "age_sec": int(now - (loc.get("ts") or 0)),
+        })
+
+    for s in db.get("servers", []):
+        if not s.get("enabled", True) or s.get("maintenance") or not s.get("latency_ms"):
+            continue
+        candidates.append({
+            "id": s.get("id"), "name": s.get("name"), "host": s.get("host"),
+            "latency_ms": s.get("latency_ms"), "jitter_ms": s.get("jitter_ms"),
+            "loss_percent": s.get("loss_percent"), "load": s.get("load"),
+            "grade": s.get("latency_grade"), "age_sec": int(now - (s.get("last_probe") or 0)),
+            "speed_mbps": s.get("download_mbps"),
+        })
+
+    if not candidates:
+        return {"ok": False, "reason": "no-measurements",
+                "hint": "POST /api/pro/servers/benchmark first"}
+
+    for c in candidates:
+        c["score"] = pro.score_node(
+            {"ok": c["latency_ms"] is not None, "avg_ms": c["latency_ms"],
+             "jitter_ms": c["jitter_ms"], "loss_percent": c["loss_percent"]},
+            {"ok": bool(c.get("speed_mbps")), "download_mbps": c.get("speed_mbps")},
+            c["load"])
+    candidates.sort(key=lambda c: c["score"])
+    return {"ok": True, "best": candidates[0], "candidates": candidates,
+            "stale": candidates[0]["age_sec"] > 900}
+
+
+# --------------------------------------------------------------- live connections
+@app.get("/speedtest.bin")
+async def speedtest_file(request: Request, mb: float = 20.0):
+    """Serve a real test payload so the speedtest measures THIS node.
+
+    Streamed in chunks (never buffered in memory) and explicitly uncached, so a
+    repeated run measures the link rather than the local proxy cache.
+    """
+    mb = max(1.0, min(200.0, float(mb)))
+    total = int(mb * 1024 * 1024)
+    chunk = b"\0" * (256 * 1024)
+
+    async def gen():
+        sent = 0
+        while sent < total:
+            n = min(len(chunk), total - sent)
+            sent += n
+            yield chunk[:n]
+            await asyncio.sleep(0)   # yield to the loop so other requests run
+
+    return StreamingResponse(
+        gen(), media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(total),
+            "Content-Disposition": 'attachment; filename="speedtest.bin"',
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+        })
+
+
+@app.get("/api/pro/connections/live")
+async def api_pro_connections_live(user: str = Depends(require_perm("analytics.read"))):
+    """Real client IPs + sessions, straight from the Xray access log."""
+    db = await store.get()
+    records = pro.parse_access_log_detailed(
+        getattr(xray_manager, "XRAY_ACCESS_LOG", ""))
+    # refresh the module-level cache the rest of the panel uses
+    try:
+        xray_manager.ip_cache = {
+            uid: {"ips": list(rec["ips"].keys())[-5:], "last": rec["last"]}
+            for uid, rec in records.items()
+        }
+    except Exception:
+        pass
+
+    by_uid = {}
+    for ib in db.get("inbounds", []):
+        uid = ib.get("uid")
+        key = ib.get("email") or uid
+        summ = pro.summarize_connections(records, key)
+        if not summ["ip_count"]:
+            summ = pro.summarize_connections(records, uid)
+        summ.update({
+            "name": ib.get("name"), "enabled": ib.get("enabled", True),
+            "blocked_ips": pro.blocklist_for_uid(db, uid),
+            "quota_gb": ib.get("quota_gb"),
+            "used_gb": round(((ib.get("used_up") or 0) + (ib.get("used_down") or 0))
+                             / (1024 ** 3), 3),
+        })
+        for i in summ["ips"]:
+            i["blocked"] = i["ip"] in summ["blocked_ips"]
+        by_uid[uid] = summ
+
+    rows = sorted(by_uid.values(), key=lambda r: r.get("last_seen") or 0, reverse=True)
+    online = [r for r in rows if r["online"]]
+    all_ips = {i["ip"] for r in rows for i in r["ips"]}
+    return {
+        "ok": True, "ts": time.time(),
+        "log_available": bool(getattr(xray_manager, "XRAY_ACCESS_LOG", "")
+                              and os.path.exists(xray_manager.XRAY_ACCESS_LOG)),
+        "total_users": len(rows), "online_users": len(online),
+        "unique_ips": len(all_ips),
+        "connections": sum(r["connections"] for r in rows),
+        "users": rows,
+    }
+
+
+@app.post("/api/pro/connections/block")
+async def api_pro_connections_block(request: Request,
+                                    user: str = Depends(require_perm("users.manage"))):
+    """Block or unblock a REAL client IP for a user, and push it to Xray.
+
+    Body: {"uid": "...", "ip": "1.2.3.4", "action": "block"|"unblock"}
+    """
+    p = await request.json()
+    uid = (p.get("uid") or "").strip()
+    ip = (p.get("ip") or "").strip()
+    action = (p.get("action") or "block").strip()
+    if not uid or not ip:
+        raise HTTPException(400, "uid-and-ip-required")
+    try:
+        import ipaddress
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "invalid-ip")
+    if action not in ("block", "unblock"):
+        raise HTTPException(400, "invalid-action")
+
+    db = await store.get()
+    if not inbound_by_uid(db, uid):
+        raise HTTPException(404, "uid-not-found")
+
+    def _m(d):
+        bl = d.setdefault("ip_blocklist", {})
+        cur = list(bl.get(uid) or [])
+        if action == "block":
+            if ip not in cur:
+                cur.append(ip)
+        else:
+            cur = [x for x in cur if x != ip]
+        if cur:
+            bl[uid] = cur
+        else:
+            bl.pop(uid, None)
+        d.setdefault("ip_block_log", []).append({
+            "ts": time.time(), "uid": uid, "ip": ip, "action": action, "by": user})
+        d["ip_block_log"] = d["ip_block_log"][-500:]
+    await store.mutate(_m)
+    refresh_xray(store.get_sync())
+    await log_audit(user, f"ip_{action}", f"{ip} on {uid}", ref=uid)
+    return {"ok": True, "uid": uid, "ip": ip, "action": action,
+            "blocked_ips": pro.blocklist_for_uid(store.get_sync(), uid)}
+
+
+@app.get("/api/pro/connections/blocked")
+async def api_pro_connections_blocked(user: str = Depends(require_perm("users.read"))):
+    db = await store.get()
+    return {"ok": True, "blocklist": db.get("ip_blocklist") or {},
+            "log": list(reversed((db.get("ip_block_log") or [])[-100:]))}
+
+
+# ---------------------------------------------------------------------- speedtest
+@app.post("/api/pro/speedtest/run")
+async def api_pro_speedtest_run(request: Request,
+                                user: str = Depends(require_perm("servers.read"))):
+    """Measure REAL throughput against each node.
+
+    Body (optional): {"duration": 6, "only": ["srv_id"], "test_url": "https://..."}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    duration = max(3.0, min(20.0, float(body.get("duration") or 6)))
+    only = body.get("only") or []
+    override_url = (body.get("test_url") or "").strip()
+
+    db = await store.get()
+    targets = await _all_probe_targets(db)
+    if only:
+        targets = [t for t in targets if t["id"] in only]
+    if not targets:
+        return {"ok": True, "results": [],
+                "note": "no-probe-targets: set public_domain or add a server"}
+
+    sem = asyncio.Semaphore(4)
+
+    async def one(t):
+        async with sem:
+            r = await pro.speedtest_server(t["host"], t["port"], duration=duration,
+                                           test_url=override_url)
+        r.update({"id": t["id"], "name": t["name"], "local": t["local"],
+                  "country": t.get("country", ""), "city": t.get("city", "")})
+        return r
+
+    results = await asyncio.gather(*(one(t) for t in targets))
+    good = [r for r in results if r.get("ok") and r.get("download_mbps")]
+    good.sort(key=lambda r: r["download_mbps"], reverse=True)
+
+    now = time.time()
+    measured = {r["id"]: r for r in results}
+
+    def _save(d):
+        hist = d.setdefault("speedtest_history", {})
+        for r in results:
+            if not r.get("ok"):
+                continue
+            entry = {"ts": now, "mbps": r.get("download_mbps"),
+                     "bytes": r.get("downloaded_bytes"),
+                     "seconds": (r.get("download") or {}).get("seconds"),
+                     "latency_ms": (r.get("latency") or {}).get("avg_ms")}
+            hist.setdefault(r["id"], []).append(entry)
+            hist[r["id"]] = hist[r["id"]][-50:]
+        for s in d.get("servers", []):
+            r = measured.get(s.get("id"))
+            if r and r.get("ok"):
+                s["download_mbps"] = r.get("download_mbps")
+                s["last_speedtest"] = now
+    await store.mutate(_save)
+    await log_audit(user, "pro_speedtest", f"{len(results)} nodes", ref="pro")
+    return {"ok": True, "ts": now, "duration": duration,
+            "fastest": good[0] if good else None, "results": results}
+
+
+@app.get("/api/pro/speedtest/results")
+async def api_pro_speedtest_results(user: str = Depends(require_perm("servers.read"))):
+    """Stored speedtest history + the latest value per node."""
+    db = await store.get()
+    hist = db.get("speedtest_history") or {}
+    nodes = []
+    for s in db.get("servers", []):
+        sid = s.get("id")
+        runs = hist.get(sid) or []
+        best = max((r.get("mbps") or 0) for r in runs) if runs else None
+        nodes.append({
+            "id": sid, "name": s.get("name"), "host": s.get("host"),
+            "latest_mbps": runs[-1]["mbps"] if runs else None,
+            "best_mbps": best,
+            "latest_at": runs[-1]["ts"] if runs else None,
+            "runs": len(runs),
+            "latency_ms": s.get("latency_ms"),
+            "history": runs[-20:],
+        })
+    local_runs = hist.get("local") or []
+    if local_runs or (db.get("settings") or {}).get("public_domain"):
+        nodes.insert(0, {
+            "id": "local", "name": (db.get("settings") or {}).get("panel_name") or "Local Server",
+            "host": (db.get("settings") or {}).get("public_domain"),
+            "latest_mbps": local_runs[-1]["mbps"] if local_runs else None,
+            "best_mbps": max((r.get("mbps") or 0) for r in local_runs) if local_runs else None,
+            "latest_at": local_runs[-1]["ts"] if local_runs else None,
+            "runs": len(local_runs), "latency_ms": None, "history": local_runs[-20:],
+        })
+    return {"ok": True, "nodes": nodes}
+
+
+# ------------------------------------------------------------------ quota prediction
+def _build_predictions(db) -> list[dict]:
+    out = []
+    now = time.time()
+    for ib in db.get("inbounds", []):
+        hist = pro.history_for(ib.get("uid"), db)
+        p = pro.predict_quota(ib, hist, now=now)
+        p["enabled"] = ib.get("enabled", True)
+        p["protocols"] = ib.get("protocols") or []
+        out.append(p)
+    order = {"critical": 0, "warning": 1, "watch": 2, "ok": 3,
+             "exhausted": 0, "unlimited": 4, "unknown": 5}
+    out.sort(key=lambda x: (order.get(x["level"], 9), x.get("days_left") or 9999))
+    return out
+
+
+@app.get("/api/pro/quota/predictions")
+async def api_pro_quota_predictions(user: str = Depends(require_perm("analytics.read"))):
+    """Real burn-rate + projected exhaustion date for every user.
+
+    Requires at least two usage samples per user; users without enough history
+    are reported with level "unknown" and confidence "none" rather than a
+    made-up estimate.
+    """
+    db = await store.get()
+    preds = _build_predictions(db)
+    summary = {}
+    for p in preds:
+        summary[p["level"]] = summary.get(p["level"], 0) + 1
+    at_risk = [p for p in preds if p["level"] in ("critical", "warning")]
+    return {
+        "ok": True, "ts": time.time(),
+        "sample_count": sum(p["samples"] for p in preds),
+        "summary": summary,
+        "at_risk": len(at_risk),
+        "predictions": preds,
+    }
+
+
+@app.post("/api/pro/quota/snapshot")
+async def api_pro_quota_snapshot(user: str = Depends(require_perm("analytics.read"))):
+    """Record a usage sample now — the fuel for the prediction engine.
+
+    Safe to call repeatedly; samples closer than 30s replace the previous one.
+    """
+    db = await store.get()
+    n = 0
+
+    def _m(d):
+        nonlocal n
+        for ib in d.get("inbounds", []):
+            used = int((ib.get("used_up") or 0) + (ib.get("used_down") or 0))
+            pro.append_history(d, ib.get("uid"), used)
+            n += 1
+    await store.mutate(_m)
+    return {"ok": True, "recorded": n, "ts": time.time()}
+
+
+@app.get("/api/pro/quota/user/{uid}")
+async def api_pro_quota_user(uid: str, user: str = Depends(require_perm("users.read"))):
+    """Detailed forecast for one user, including the raw history we used."""
+    db = await store.get()
+    ib = inbound_by_uid(db, uid)
+    if not ib:
+        raise HTTPException(404, "not-found")
+    hist = pro.history_for(uid, db)
+    p = pro.predict_quota(ib, hist)
+    p["hours_to_exhaust"] = pro.hours_to_exhaust(ib, hist)
+    return {"ok": True, "prediction": p, "history": hist[-120:],
+            "history_points": len(hist)}
+
+
+# ------------------------------------------------------------------ panel overview
+@app.get("/api/pro/overview")
+async def api_pro_overview(user: str = Depends(require_perm("analytics.read"))):
+    """One call that powers the whole Pro dashboard."""
+    db = await store.get()
+    records = pro.parse_access_log_detailed(
+        getattr(xray_manager, "XRAY_ACCESS_LOG", ""))
+    preds = _build_predictions(db)
+
+    online_uids = []
+    for ib in db.get("inbounds", []):
+        s = pro.summarize_connections(records, ib.get("email") or ib.get("uid"))
+        if not s["ip_count"]:
+            s = pro.summarize_connections(records, ib.get("uid"))
+        if s["online"]:
+            online_uids.append(ib.get("uid"))
+
+    servers = []
+    loc = db.get("local_probe") or {}
+    if loc.get("latency_ms") is not None:
+        servers.append({
+            "id": "local", "name": loc.get("name") or "Local Server",
+            "host": loc.get("host"), "online": loc.get("online"),
+            "latency_ms": loc.get("latency_ms"), "jitter_ms": loc.get("jitter_ms"),
+            "loss_percent": loc.get("loss_percent"), "grade": loc.get("grade"),
+            "load": None, "download_mbps": loc.get("speed_mbps"),
+            "last_probe": loc.get("ts"), "country": "", "city": "",
+        })
+    for s in db.get("servers", []):
+        servers.append({
+            "id": s.get("id"), "name": s.get("name"), "host": s.get("host"),
+            "online": s.get("online"), "latency_ms": s.get("latency_ms"),
+            "jitter_ms": s.get("jitter_ms"), "loss_percent": s.get("loss_percent"),
+            "grade": s.get("latency_grade"), "load": s.get("load"),
+            "download_mbps": s.get("download_mbps"),
+            "last_probe": s.get("last_probe"), "country": s.get("country"),
+            "city": s.get("city"),
+        })
+    servers.sort(key=lambda s: (s.get("latency_ms") is None, s.get("latency_ms") or 9999))
+
+    risk = [p for p in preds if p["level"] in ("critical", "warning", "watch")][:10]
+    hist = db.get("speedtest_history") or {}
+    return {
+        "ok": True, "ts": time.time(),
+        "connections": {
+            "online_users": len(online_uids),
+            "unique_ips": len({i["ip"] for r in records.values() for i in r["ips"]}),
+            "total_connections": sum(r["total"] for r in records.values()),
+            "blocked": sum(len(v or []) for v in (db.get("ip_blocklist") or {}).values()),
+        },
+        "servers": servers,
+        "best_server": servers[0] if servers else None,
+        "quota": {"at_risk": risk, "counts": _summary(preds)},
+        "speedtest": {"nodes": len([k for k, v in hist.items() if v]),
+                      "last_run": max((v[-1]["ts"] for v in hist.values() if v), default=None)},
+        "benchmark": db.get("last_benchmark"),
+    }
+
+
+def _summary(preds: list[dict]) -> dict:
+    s: dict[str, int] = {}
+    for p in preds:
+        s[p["level"]] = s.get(p["level"], 0) + 1
+    return s
 
 
 # ------------------------------------------------------------------ public status api

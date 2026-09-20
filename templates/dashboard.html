@@ -36,6 +36,7 @@
       <div class="nav-section-label">✨ <span data-i18n="nav_premium">امکانات ویژه</span></div>
       <div class="nav-item" data-view="plans"><svg><use href="#icon-crown"/></svg><span data-i18n="nav_plans">پلن‌ها</span></div>
       <div class="nav-item" data-view="servers"><svg><use href="#icon-globe"/></svg><span data-i18n="nav_servers">سرورها</span><span class="badge" id="navServerCount">1</span></div>
+      <div class="nav-item" data-view="protools"><svg><use href="#icon-bolt"/></svg><span data-i18n="nav_protools">ابزار حرفه‌ای</span><span class="badge" id="navProBadge" style="display:none;">●</span></div>
       <div class="nav-item" data-view="monitoring"><svg><use href="#icon-bolt"/></svg><span data-i18n="nav_monitoring">مانیتورینگ</span></div>
       <div class="nav-item" data-view="map"><svg><use href="#icon-globe"/></svg><span data-i18n="nav_map">نقشه سرورها</span></div>
       <div class="nav-item" data-view="compare"><svg><use href="#icon-traffic"/></svg><span data-i18n="nav_compare">مقایسه</span></div>
@@ -632,6 +633,85 @@
         </div>
       </section>
 
+      <!-- ============ PRO TOOLS VIEW ============ -->
+      <section class="view" id="view-protools">
+        <div class="grid mb-16" id="proCards">
+          <div class="col-3 win stat-card"><div class="label"><span class="pill-dot" style="color:var(--emerald)"></span><span data-i18n="pro_online_users">کاربران آنلاین</span></div><div class="value" id="proOnline">0</div></div>
+          <div class="col-3 win stat-card"><div class="label"><span data-i18n="pro_unique_ips">آی‌پی یکتا</span></div><div class="value" id="proIps">0</div></div>
+          <div class="col-3 win stat-card"><div class="label"><span data-i18n="pro_best_node">بهترین نود</span></div><div class="value" id="proBest">—</div></div>
+          <div class="col-3 win stat-card"><div class="label"><span class="pill-dot" style="color:var(--gold-500)"></span><span data-i18n="pro_at_risk">کاربران در خطر</span></div><div class="value" id="proAtRisk">0</div></div>
+        </div>
+
+        <!-- 1. best server -->
+        <div class="win mb-16">
+          <div class="win-head"><h3><svg><use href="#icon-bolt"/></svg><span data-i18n="pro_bench_title">سنجش زنده سرورها (تأخیر واقعی)</span></h3>
+            <div class="toolbar">
+              <select class="input btn-sm" id="proSamples" style="max-width:110px;">
+                <option value="3">3 <span data-i18n="pro_samples">نمونه</span></option>
+                <option value="5">5</option>
+                <option value="8">8</option>
+              </select>
+              <label class="small flex-row gap-4" style="align-items:center;cursor:pointer;">
+                <input type="checkbox" id="proWithSpeed"> <span data-i18n="pro_with_speed">همراه با تست سرعت</span>
+              </label>
+              <button class="btn btn-emerald btn-sm" id="proBenchBtn"><span data-i18n="pro_run_bench">اجرای سنجش</span></button>
+              <button class="btn btn-azure btn-sm" id="proAutoPickBtn"><span data-i18n="pro_auto_pick">انتخاب بهترین</span></button>
+            </div>
+          </div>
+          <div class="win-body no-pad"><div class="table-wrap"><table class="data-table">
+            <thead><tr><th>#</th><th data-i18n="inb_name">نام</th><th>Host</th><th data-i18n="pro_grade">کیفیت</th><th data-i18n="pro_avg">میانگین</th><th data-i18n="pro_min_max">کمین/بیشین</th><th data-i18n="pro_jitter">لرزش</th><th data-i18n="pro_loss">افت</th><th data-i18n="pro_speed">سرعت</th><th data-i18n="pro_score">امتیاز</th></tr></thead>
+            <tbody id="proServersBody"><tr><td colspan="10" class="small" style="text-align:center;opacity:.6;" data-i18n="pro_not_measured">هنوز سنجشی انجام نشده است.</td></tr></tbody>
+          </table></div></div>
+        </div>
+
+        <!-- 2. live connections -->
+        <div class="win mb-16">
+          <div class="win-head"><h3><svg><use href="#icon-users"/></svg><span data-i18n="pro_conn_title">اتصالات زنده — آی‌پی واقعی</span></h3>
+            <div class="toolbar">
+              <input class="input btn-sm" id="proConnSearch" placeholder="جستجوی نام یا آی‌پی…" style="max-width:200px;">
+              <button class="btn btn-ghost btn-sm" id="proConnRefresh"><span data-i18n="pro_refresh">بروزرسانی</span></button>
+            </div>
+          </div>
+          <div class="win-body no-pad"><div class="table-wrap"><table class="data-table">
+            <thead><tr><th data-i18n="inb_name">کاربر</th><th data-i18n="pro_status">وضعیت</th><th data-i18n="pro_ips">آی‌پی‌ها</th><th data-i18n="pro_conns">اتصالات</th><th data-i18n="pro_last_seen">آخرین فعالیت</th><th data-i18n="pro_actions">عملیات</th></tr></thead>
+            <tbody id="proConnBody"><tr><td colspan="6" class="small" style="text-align:center;opacity:.6;">—</td></tr></tbody>
+          </table></div></div>
+        </div>
+
+        <!-- 3. speedtest -->
+        <div class="win mb-16">
+          <div class="win-head"><h3><svg><use href="#icon-traffic"/></svg><span data-i18n="pro_speed_title">تست سرعت واقعی</span></h3>
+            <div class="toolbar">
+              <select class="input btn-sm" id="proSpeedDur" style="max-width:120px;">
+                <option value="5">5s</option><option value="8" selected>8s</option><option value="12">12s</option>
+              </select>
+              <button class="btn btn-emerald btn-sm" id="proSpeedBtn"><span data-i18n="pro_run_speed">شروع تست</span></button>
+            </div>
+          </div>
+          <div class="win-body no-pad"><div class="table-wrap"><table class="data-table">
+            <thead><tr><th>#</th><th data-i18n="inb_name">نام</th><th data-i18n="pro_host">میزبان</th><th data-i18n="pro_latest">آخرین</th><th data-i18n="pro_best">بهترین</th><th data-i18n="pro_runs">تعداد اجرا</th><th data-i18n="pro_last_run">زمان</th></tr></thead>
+            <tbody id="proSpeedBody"><tr><td colspan="7" class="small" style="text-align:center;opacity:.6;">—</td></tr></tbody>
+          </table></div></div>
+        </div>
+
+        <!-- 4. quota prediction -->
+        <div class="win">
+          <div class="win-head"><h3><svg><use href="#icon-clock"/></svg><span data-i18n="pro_quota_title">پیش‌بینی اتمام حجم</span></h3>
+            <div class="toolbar">
+              <label class="small flex-row gap-4" style="align-items:center;">
+                <input type="checkbox" id="proQuotaOnlyRisk" checked> <span data-i18n="pro_only_risk">فقط پرخطرها</span>
+              </label>
+              <button class="btn btn-ghost btn-sm" id="proQuotaSnap"><span data-i18n="pro_take_snapshot">ثبت نمونه</span></button>
+              <button class="btn btn-azure btn-sm" id="proQuotaRefresh"><span data-i18n="pro_refresh">بروزرسانی</span></button>
+            </div>
+          </div>
+          <div class="win-body no-pad"><div class="table-wrap"><table class="data-table">
+            <thead><tr><th data-i18n="inb_name">کاربر</th><th data-i18n="pro_level">وضعیت</th><th data-i18n="pro_used">مصرف</th><th data-i18n="pro_remaining">باقیمانده</th><th data-i18n="pro_burn">نرخ مصرف</th><th data-i18n="pro_days_left">روز تا اتمام</th><th data-i18n="pro_exhaust_at">تاریخ تخمینی</th><th data-i18n="pro_confidence">اعتبار</th></tr></thead>
+            <tbody id="proQuotaBody"><tr><td colspan="8" class="small" style="text-align:center;opacity:.6;">—</td></tr></tbody>
+          </table></div></div>
+        </div>
+      </section>
+
       <!-- ============ MONITORING VIEW ============ -->
       <section class="view" id="view-monitoring">
         <div class="grid mb-16" id="monitoringCards">
@@ -1002,6 +1082,16 @@
             <label class="switch"><input type="checkbox" id="fStrictIp"><span class="track"><span class="thumb"></span></span></label>
           </div>
           <div class="field span-2">
+            <label><span data-i18n="proto_label">پروتکل‌های فعال</span> <span class="small muted">(<span data-i18n="proto_hint">هر تعداد که بخواهید انتخاب کنید</span>)</span></label>
+            <div class="proto-picker" id="fProtocols">
+              <label class="proto-chip"><input type="checkbox" value="vless" checked><span>VLESS</span></label>
+              <label class="proto-chip"><input type="checkbox" value="vmess" checked><span>VMess</span></label>
+              <label class="proto-chip"><input type="checkbox" value="trojan"><span>Trojan</span></label>
+              <label class="proto-chip"><input type="checkbox" value="shadowsocks"><span>Shadowsocks</span></label>
+            </div>
+            <div class="small muted mt-8" data-i18n="proto_note">پروتکل‌های انتخاب‌شده در لینک‌ها، سابسکریپشن و کانفیگ Xray این کاربر ساخته می‌شوند.</div>
+          </div>
+          <div class="field span-2">
             <label data-i18n="inb_note">یادداشت</label>
             <input class="input" type="text" id="fNote" maxlength="200">
           </div>
@@ -1281,6 +1371,7 @@
 <script src="/static/js/chart-mini.js?v={{ app_version }}"></script>
 <script src="/static/js/dashboard.js?v={{ app_version }}"></script>
 <script src="/static/js/premium-features.js?v={{ app_version }}"></script>
+<script src="/static/js/pro-tools.js?v={{ app_version }}"></script>
 <script src="/static/js/ultimate.js?v={{ app_version }}"></script>
 </body>
 </html>

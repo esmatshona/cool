@@ -10,6 +10,10 @@ XRAY_CONFIG_PATH = os.environ.get("XRAY_CONFIG_PATH") or (
 )
 XRAY_BIN = os.environ.get("XRAY_BIN") or "/usr/local/bin/xray"
 
+# Shadowsocks listens on its own TCP port (no WS/TLS transport available).
+SS_PORT = int(os.environ.get("SS_PORT", "8388"))
+SS_METHOD = os.environ.get("SS_METHOD", "2022-blake3-aes-128-gcm")
+
 # Access log: source of per-user IPs + last-connection times.
 # Xray access lines look like: 2026/01/01 10:00:00 1.2.3.4:5678 accepted tcp:... [email]
 XRAY_ACCESS_LOG = os.environ.get("XRAY_ACCESS_LOG") or (
@@ -21,9 +25,18 @@ ACCESS_LOG_MAX_BYTES = 5 * 1024 * 1024
 xray_process = None
 ip_cache = {}  # uid -> {"ips": [recent unique], "last": epoch|None}
 
-def generate_xray_config(inbounds_data, log_level="warning"):
+def generate_xray_config(inbounds_data, log_level="warning", ip_blocklist=None):
+    """Build the Xray config.
+
+    `ip_blocklist` maps uid -> [ip, ...]. Blocked source addresses are enforced
+    with a real Xray routing rule that rejects the traffic (blackhole), so a
+    block applied from the panel takes effect on the next config reload — it is
+    not a cosmetic flag.
+    """
     clients_vless = []
     clients_vmess = []
+    clients_trojan = []
+    clients_ss = []
 
     for ib in inbounds_data:
         if not ib.get("enabled", True):
@@ -31,8 +44,33 @@ def generate_xray_config(inbounds_data, log_level="warning"):
 
         uuid = ib["uuid"]
         uid = ib["uid"]
-        clients_vless.append({"id": uuid, "email": uid})
-        clients_vmess.append({"id": uuid, "email": uid})
+        protos = ib.get("protocols") or ["vless", "vmess"]
+
+        if "vless" in protos:
+            clients_vless.append({"id": uuid, "email": uid})
+        if "vmess" in protos:
+            clients_vmess.append({"id": uuid, "email": uid})
+        if "trojan" in protos:
+            clients_trojan.append({
+                "password": ib.get("trojan_password") or uuid.replace("-", ""),
+                "email": uid,
+            })
+        if "shadowsocks" in protos:
+            clients_ss.append({
+                "password": ib.get("ss_password") or uuid.replace("-", "")[:24],
+                "email": uid,
+            })
+
+    # ---- real IP blocking -> routing rules ----
+    blocked_ips = []
+    try:
+        for _uid, ips in (ip_blocklist or {}).items():
+            for ip in (ips or []):
+                ip = str(ip).strip()
+                if ip and ip not in blocked_ips:
+                    blocked_ips.append(ip)
+    except Exception:
+        blocked_ips = []
 
     if log_level not in ("debug", "info", "warning", "error", "none"):
         log_level = "warning"
@@ -97,17 +135,48 @@ def generate_xray_config(inbounds_data, log_level="warning"):
                 "settings": {"clients": clients_vless, "decryption": "none"},
                 "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/vl-xhttp"}},
                 "tag": "inbound-vless-xhttp"
+            },
+            {
+                "listen": "127.0.0.1",
+                "port": 10005,
+                "protocol": "trojan",
+                "settings": {"clients": clients_trojan},
+                "streamSettings": {"network": "ws", "wsSettings": {"path": "/tr-ws"}},
+                "tag": "inbound-trojan-ws"
+            },
+            {
+                "listen": "0.0.0.0",
+                "port": SS_PORT,
+                "protocol": "shadowsocks",
+                "settings": {
+                    "clients": clients_ss,
+                    "method": SS_METHOD,
+                    "network": "tcp,udp",
+                },
+                "tag": "inbound-ss"
             }
         ],
-        "outbounds": [{"protocol": "freedom"}],
+        "outbounds": [
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "blackhole", "tag": "blocked"},
+        ],
         "routing": {
-            "rules": [
-                {
-                    "inboundTag": ["api"],
-                    "outboundTag": "api",
-                    "type": "field"
-                }
-            ]
+            "domainStrategy": "AsIs",
+            "rules": (
+                # blocked source IPs are dropped before anything else
+                ([{
+                    "type": "field",
+                    "source": [f"{ip}" if "/" in ip else f"{ip}/32" for ip in blocked_ips],
+                    "outboundTag": "blocked",
+                }] if blocked_ips else [])
+                + [
+                    {
+                        "inboundTag": ["api"],
+                        "outboundTag": "api",
+                        "type": "field"
+                    }
+                ]
+            )
         }
     }
 
