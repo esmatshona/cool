@@ -431,21 +431,38 @@ def _inbound_by_uid(db, uid):
     return None
 
 
+def _ss_creds() -> dict:
+    """Shadowsocks credentials with a cipher-correct key.
+
+    2022-blake3-* requires a base64 PSK of the exact key length; handing xray
+    a random text password aborts the entire engine ("missing psk"), taking
+    every other protocol down with it.
+    """
+    try:
+        import xray_manager as _xm
+        method = _xm.SS_METHOD
+        return {"ss_password": _xm.make_ss_key(method), "ss_method": method}
+    except Exception:
+        # Defensive fallback: still emit a valid 16-byte base64 PSK.
+        return {"ss_password": base64.b64encode(secrets.token_bytes(16)).decode(),
+                "ss_method": "2022-blake3-aes-128-gcm"}
+
+
 def _make_inbound_dict(name: str, quota_gb: float, days: int, fp: str, note: str,
                        protocols=None) -> dict:
     now = time.time()
-    return {"uid": secrets.token_hex(8), "uuid": __import__("uuid").uuid4().__str__(),
-            "name": name[:64], "enabled": True, "created_at": now,
-            "expire_days": max(0, days), "expire_at": (now + days * 86400) if days > 0 else None,
-            "quota_gb": max(0.0, float(quota_gb)), "max_connections": 0, "max_requests": 0,
-            "request_count": 0, "used_up": 0, "used_down": 0, "fp": fp or "chrome",
-            "strict_single_ip": False, "note": note[:200],
-            "sub_token": secrets.token_hex(12), "sub_enabled": True,
-            "plan_id": None, "plan_name": "",
-            "protocols": protocols or ["vless", "vmess"],
-            "trojan_password": secrets.token_hex(16),
-            "ss_password": secrets.token_urlsafe(18)[:24],
-            "ss_method": "2022-blake3-aes-128-gcm"}
+    ib = {"uid": secrets.token_hex(8), "uuid": __import__("uuid").uuid4().__str__(),
+          "name": name[:64], "enabled": True, "created_at": now,
+          "expire_days": max(0, days), "expire_at": (now + days * 86400) if days > 0 else None,
+          "quota_gb": max(0.0, float(quota_gb)), "max_connections": 0, "max_requests": 0,
+          "request_count": 0, "used_up": 0, "used_down": 0, "fp": fp or "chrome",
+          "strict_single_ip": False, "note": note[:200],
+          "sub_token": secrets.token_hex(12), "sub_enabled": True,
+          "plan_id": None, "plan_name": "",
+          "protocols": protocols or ["vless", "vmess"],
+          "trojan_password": secrets.token_hex(16)}
+    ib.update(_ss_creds())
+    return ib
 
 
 def _user_snapshot_lines(ib) -> list:

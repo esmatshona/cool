@@ -1,5 +1,7 @@
 import json
 import os
+import base64
+import secrets
 import subprocess
 import asyncio
 import logging
@@ -13,6 +15,70 @@ XRAY_BIN = os.environ.get("XRAY_BIN") or "/usr/local/bin/xray"
 # Shadowsocks listens on its own TCP port (no WS/TLS transport available).
 SS_PORT = int(os.environ.get("SS_PORT", "8388"))
 SS_METHOD = os.environ.get("SS_METHOD", "2022-blake3-aes-128-gcm")
+
+# ---- Shadowsocks-2022 key handling -----------------------------------------
+# 2022-blake3-* is NOT a plain-text password cipher: Xray requires a base64
+# *PSK* whose decoded length exactly matches the cipher's key size. Feeding it
+# a random text password (e.g. token_hex(12)) makes the proxy fail with
+# "missing psk" and — because that aborts the whole server — takes EVERY other
+# protocol down with it. These helpers guarantee a byte-correct key.
+SS2022_KEY_BYTES = {
+    "2022-blake3-aes-128-gcm": 16,
+    "2022-blake3-aes-256-gcm": 32,
+}
+SS2022_METHODS = tuple(SS2022_KEY_BYTES)
+# Legacy AEAD ciphers accept an arbitrary text password, so one fixed length
+# works for all of them.
+SS_LEGACY_KEY_CHARS = 24
+
+
+def is_ss2022(method: str) -> bool:
+    return (method or "") in SS2022_METHODS
+
+
+def make_ss_key(method: str) -> str:
+    """Return a cipher-correct Shadowsocks password for `method`.
+
+    - 2022-blake3-* -> base64 of exactly 16/32 random bytes (a real PSK)
+    - anything else -> a random 24-char text password (AEAD style)
+    """
+    if is_ss2022(method):
+        return base64.b64encode(secrets.token_bytes(SS2022_KEY_BYTES[method])).decode()
+    return secrets.token_urlsafe(32)[:SS_LEGACY_KEY_CHARS]
+
+
+def ss_key_is_valid(method: str, password) -> bool:
+    """True when `password` can actually be used with `method`."""
+    if not password or not isinstance(password, str):
+        return False
+    if not is_ss2022(method):
+        return True
+    try:
+        raw = base64.b64decode(password, validate=True)
+    except Exception:
+        return False
+    return len(raw) == SS2022_KEY_BYTES[method]
+
+
+def repair_ss_key(ib: dict, method: str) -> str:
+    """Ensure `ib` carries a usable SS key; returns the (possibly new) key.
+
+    Note: this regenerates the key when it is unusable, which invalidates the
+    old ss:// link for that user — but a broken key means no working link at
+    all, so a fresh one is strictly better than a dead engine.
+    """
+    current = ib.get("ss_password")
+    if ss_key_is_valid(method, current):
+        return current
+    key = make_ss_key(method)
+    ib["ss_password"] = key
+    return key
+
+
+async def ss_key_needs_refresh(method: str, password) -> bool:
+    """Async wrapper used by callers that prefer the manager API."""
+    return not ss_key_is_valid(method, password)
+
 
 # Access log: source of per-user IPs + last-connection times.
 # Xray access lines look like: 2026/01/01 10:00:00 1.2.3.4:5678 accepted tcp:... [email]
@@ -37,6 +103,7 @@ def generate_xray_config(inbounds_data, log_level="warning", ip_blocklist=None):
     clients_vmess = []
     clients_trojan = []
     clients_ss = []
+    used_ss_methods = set()
 
     for ib in inbounds_data:
         if not ib.get("enabled", True):
@@ -56,10 +123,17 @@ def generate_xray_config(inbounds_data, log_level="warning", ip_blocklist=None):
                 "email": uid,
             })
         if "shadowsocks" in protos:
+            # A 2022-blake3 client MUST carry a base64 PSK of the right length;
+            # anything else makes Xray refuse to boot at all. Repair in place so
+            # one legacy/garbage key can never take the whole engine down.
+            method = ib.get("ss_method") or SS_METHOD
+            key = repair_ss_key(ib, method)
             clients_ss.append({
-                "password": ib.get("ss_password") or uuid.replace("-", "")[:24],
+                "password": key,
                 "email": uid,
+                "method": method,
             })
+            used_ss_methods.add(method)
 
     # ---- real IP blocking -> routing rules ----
     blocked_ips = []
@@ -75,6 +149,72 @@ def generate_xray_config(inbounds_data, log_level="warning", ip_blocklist=None):
     if log_level not in ("debug", "info", "warning", "error", "none"):
         log_level = "warning"
     _rotate_access_log()
+
+    # Xray refuses to start an inbound with no clients, and a single such
+    # inbound aborts the ENTIRE server. Only build the ones we can serve.
+    inbounds = [
+        {
+            "listen": "127.0.0.1",
+            "port": 10085,
+            "protocol": "dokodemo-door",
+            "settings": {"address": "127.0.0.1"},
+            "tag": "api"
+        },
+        {
+            "listen": "127.0.0.1",
+            "port": 10001,
+            "protocol": "vless",
+            "settings": {"clients": clients_vless, "decryption": "none"},
+            "streamSettings": {"network": "ws", "wsSettings": {"path": "/vl-ws"}},
+            "tag": "inbound-vless-ws"
+        },
+        {
+            "listen": "127.0.0.1",
+            "port": 10002,
+            "protocol": "vmess",
+            "settings": {"clients": clients_vmess},
+            "streamSettings": {"network": "ws", "wsSettings": {"path": "/vm-ws"}},
+            "tag": "inbound-vmess-ws"
+        },
+        {
+            "listen": "127.0.0.1",
+            "port": 10004,
+            "protocol": "vless",
+            "settings": {"clients": clients_vless, "decryption": "none"},
+            "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/vl-xhttp"}},
+            "tag": "inbound-vless-xhttp"
+        },
+        {
+            "listen": "127.0.0.1",
+            "port": 10005,
+            "protocol": "trojan",
+            "settings": {"clients": clients_trojan},
+            "streamSettings": {"network": "ws", "wsSettings": {"path": "/tr-ws"}},
+            "tag": "inbound-trojan-ws"
+        },
+    ]
+    if clients_ss:
+        # One SS inbound can only carry ONE cipher, so group clients by method.
+        # (Mixing methods in a single inbound is another fatal-start case.)
+        by_method = {}
+        for cl in clients_ss:
+            by_method.setdefault(cl.get("method") or SS_METHOD, []).append(
+                {"password": cl["password"], "email": cl["email"]})
+        first = True
+        for i, (method, cls) in enumerate(sorted(by_method.items())):
+            inbounds.append({
+                "listen": "0.0.0.0",
+                "port": SS_PORT if first else SS_PORT + i,
+                "protocol": "shadowsocks",
+                "settings": {
+                    "clients": cls,
+                    "method": method,
+                    "network": "tcp,udp",
+                },
+                "tag": "inbound-ss" if first else f"inbound-ss-{i}",
+            })
+            first = False
+
     config = {
         "log": {"loglevel": log_level, "access": XRAY_ACCESS_LOG},
         "dns": {
@@ -104,58 +244,7 @@ def generate_xray_config(inbounds_data, log_level="warning", ip_blocklist=None):
                 "statsInboundDownlink": True
             }
         },
-        "inbounds": [
-            {
-                "listen": "127.0.0.1",
-                "port": 10085,
-                "protocol": "dokodemo-door",
-                "settings": {"address": "127.0.0.1"},
-                "tag": "api"
-            },
-            {
-                "listen": "127.0.0.1",
-                "port": 10001,
-                "protocol": "vless",
-                "settings": {"clients": clients_vless, "decryption": "none"},
-                "streamSettings": {"network": "ws", "wsSettings": {"path": "/vl-ws"}},
-                "tag": "inbound-vless-ws"
-            },
-            {
-                "listen": "127.0.0.1",
-                "port": 10002,
-                "protocol": "vmess",
-                "settings": {"clients": clients_vmess},
-                "streamSettings": {"network": "ws", "wsSettings": {"path": "/vm-ws"}},
-                "tag": "inbound-vmess-ws"
-            },
-            {
-                "listen": "127.0.0.1",
-                "port": 10004,
-                "protocol": "vless",
-                "settings": {"clients": clients_vless, "decryption": "none"},
-                "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/vl-xhttp"}},
-                "tag": "inbound-vless-xhttp"
-            },
-            {
-                "listen": "127.0.0.1",
-                "port": 10005,
-                "protocol": "trojan",
-                "settings": {"clients": clients_trojan},
-                "streamSettings": {"network": "ws", "wsSettings": {"path": "/tr-ws"}},
-                "tag": "inbound-trojan-ws"
-            },
-            {
-                "listen": "0.0.0.0",
-                "port": SS_PORT,
-                "protocol": "shadowsocks",
-                "settings": {
-                    "clients": clients_ss,
-                    "method": SS_METHOD,
-                    "network": "tcp,udp",
-                },
-                "tag": "inbound-ss"
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": [
             {"protocol": "freedom", "tag": "direct"},
             {"protocol": "blackhole", "tag": "blocked"},
@@ -188,6 +277,8 @@ def generate_xray_config(inbounds_data, log_level="warning", ip_blocklist=None):
             json.dump(config, f, indent=2)
     except OSError as e:
         logging.warning("Could not write xray config to %s: %s (continuing without xray)", XRAY_CONFIG_PATH, e)
+    return config
+
 
 def restart_xray():
     stop_xray()
@@ -251,10 +342,30 @@ def validate_config() -> dict:
             errors.append(f"duplicate tag: {ib['tag']}")
         else:
             tags.add(ib["tag"])
-        cls = ib.get("settings", {}).get("clients", [])
-        for cl in cls:
-            if not cl.get("id"):
-                errors.append(f"client without id in {ib.get('tag')}")
+        settings = ib.get("settings") or {}
+        cls = settings.get("clients", [])
+        proto = ib.get("protocol")
+        if proto == "shadowsocks":
+            # SS clients carry password+email (no `id`), and 2022-blake3 needs
+            # a base64 PSK of exactly the cipher's key length or Xray dies.
+            method = settings.get("method") or ""
+            if not cls:
+                errors.append(f"shadowsocks inbound {ib.get('tag')} has no clients")
+            for cl in cls:
+                if not cl.get("password"):
+                    errors.append(f"ss client without password in {ib.get('tag')}")
+                elif not ss_key_is_valid(method, cl.get("password")):
+                    errors.append(
+                        f"invalid {method} psk for {cl.get('email')} in {ib.get('tag')}")
+        elif proto == "trojan":
+            # Trojan authenticates with a password, not a UUID.
+            for cl in cls:
+                if not cl.get("password"):
+                    errors.append(f"trojan client without password in {ib.get('tag')}")
+        else:
+            for cl in cls:
+                if not cl.get("id"):
+                    errors.append(f"client without id in {ib.get('tag')}")
     n_clients = sum(len((ib.get("settings") or {}).get("clients", []))
                     for ib in cfg.get("inbounds", []) if isinstance(ib, dict))
     return {"ok": not errors, "errors": errors[:10], "inbounds": len(tags), "clients": n_clients}

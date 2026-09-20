@@ -1858,8 +1858,11 @@ async def api_create_inbound(request: Request, user: str = Depends(require_perm(
         # ---- multi-protocol support ----
         "protocols": protocols,
         "trojan_password": secrets.token_hex(16),
-        "ss_password": secrets.token_urlsafe(18)[:24],
-        "ss_method": payload.get("ss_method") or "2022-blake3-aes-128-gcm",
+        # 2022-blake3-* needs a base64 PSK of the exact cipher key length —
+        # a plain text password makes Xray refuse to boot entirely.
+        "ss_password": xray_manager.make_ss_key(
+            payload.get("ss_method") or xray_manager.SS_METHOD),
+        "ss_method": payload.get("ss_method") or xray_manager.SS_METHOD,
     }
     plan_id = (payload.get("plan_id") or "").strip()
     if plan_id:
@@ -3135,10 +3138,12 @@ def build_links(request: Request, db, ib) -> dict:
         )
 
     # ---- Shadowsocks (AEAD 2022, TCP). Password is stored per-user so it stays
-    #      stable across regenerations of the subscription. ----
+    #      stable across regenerations of the subscription. The key MUST be a
+    #      cipher-correct base64 PSK for 2022-blake3-* — repair it here too so a
+    #      stored bad key yields a working link instead of a dead engine. ----
     if "shadowsocks" in protos:
-        ss_pw = ib.get("ss_password") or uuidv.replace("-", "")[:24]
-        ss_method = (ib.get("ss_method") or "2022-blake3-aes-128-gcm")
+        ss_method = (ib.get("ss_method") or xray_manager.SS_METHOD)
+        ss_pw = xray_manager.repair_ss_key(ib, ss_method)
         userinfo = base64.urlsafe_b64encode(f"{ss_method}:{ss_pw}".encode()).decode().rstrip("=")
         all_links.append(f"ss://{userinfo}@{host}:{SS_PORT}#{quote(remark('shadowsocks', 'TCP'))}")
 
@@ -3217,8 +3222,8 @@ def build_clash_yaml(request: Request, db, ib) -> str:
                 "network: ws", "ws-opts:", "  path: /tr-ws", "  headers:",
                 f"    Host: {host}"])
     if "shadowsocks" in protos:
-        ss_pw = ib.get("ss_password") or ib["uuid"].replace("-", "")[:24]
-        ss_method = ib.get("ss_method") or "2022-blake3-aes-128-gcm"
+        ss_method = ib.get("ss_method") or xray_manager.SS_METHOD
+        ss_pw = xray_manager.repair_ss_key(ib, ss_method)
         n = f"{prefix}-{name}-SS-TCP"
         add(n, ["type: ss", f"server: {host}", f"port: {SS_PORT}",
                 f"cipher: {ss_method}", f"password: \"{ss_pw}\"", "udp: true"])
@@ -3276,10 +3281,11 @@ def build_singbox_config(request: Request, db, ib) -> dict:
         tags.append(t)
     if "shadowsocks" in protos:
         t = f"{prefix}-{name}-SS-TCP"
+        _ss_method = ib.get("ss_method") or xray_manager.SS_METHOD
         outs.append({"type": "shadowsocks", "tag": t, "server": host,
                      "server_port": SS_PORT,
-                     "method": ib.get("ss_method") or "2022-blake3-aes-128-gcm",
-                     "password": ib.get("ss_password") or ib["uuid"].replace("-", "")[:24]})
+                     "method": _ss_method,
+                     "password": xray_manager.repair_ss_key(ib, _ss_method)})
         tags.append(t)
 
     outs.append({"type": "direct", "tag": "direct"})
