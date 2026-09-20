@@ -77,6 +77,73 @@ DOH_SECONDARY = "https://8.8.8.8/dns-query"
 doh_http_client = httpx.AsyncClient(timeout=6.0, follow_redirects=True)
 
 
+async def _apply_admin_reset_from_env():
+    """Emergency admin recovery via environment variables.
+
+    Set ADMIN_RESET_USERNAME + ADMIN_RESET_PASSWORD on the host to force the
+    admin password on boot. This is the documented recovery path when the
+    panel operator has lost the password (e.g. a fresh Railway volume).
+
+    Safety rules:
+      - only runs when BOTH env vars are set and the password meets the
+        minimum length, so it can never trigger by accident;
+      - after a successful reset, ADMIN_RESET_PASSWORD should be removed from
+        the host, otherwise the password is re-applied on every boot.
+    """
+    import os as _os
+    username = (_os.environ.get("ADMIN_RESET_USERNAME") or "").strip()
+    password = _os.environ.get("ADMIN_RESET_PASSWORD") or ""
+    if not username or not password:
+        return
+    if len(password) < core_security.MIN_PASSWORD_LEN:
+        print("[admin-reset] skipped: password shorter than "
+              f"{core_security.MIN_PASSWORD_LEN} chars")
+        return
+
+    db = await store.get()
+    existing = db.get("admin")
+    # Only reset when the account already exists OR nothing is configured.
+    if existing and existing.get("username") != username:
+        print(f"[admin-reset] skipped: configured admin is "
+              f"{existing.get('username')!r}, env asked for {username!r}")
+        return
+    if existing and admin_credential_ok(existing, password):
+        print("[admin-reset] password already matches, nothing to do")
+        return
+
+    hp = hash_password(password)
+
+    def _apply(d):
+        d["admin"] = {
+            "username": username,
+            "password_hash": hp["hash"],
+            "salt": hp["salt"],
+            "created_at": time.time(),
+        }
+        admins = d.setdefault("admins", [])
+        for a in admins:
+            if a.get("username") == username:
+                a["password_hash"] = hp["hash"]
+                a["salt"] = hp["salt"]
+                a["enabled"] = True
+                break
+        else:
+            admins.append({
+                "id": "admin_" + gen_uid(),
+                "username": username,
+                "password_hash": hp["hash"],
+                "salt": hp["salt"],
+                "role": "owner",
+                "enabled": True,
+                "created_at": time.time(),
+                "totp_secret": None,
+            })
+
+    await store.mutate(_apply)
+    print(f"[admin-reset] password updated for {username!r} — "
+          "remove ADMIN_RESET_PASSWORD from the host now")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     flush_task = asyncio.create_task(_periodic_flush())
@@ -85,6 +152,11 @@ async def lifespan(app: FastAPI):
     tg_task = asyncio.create_task(_telegram_poll_loop())
     srv_task = asyncio.create_task(_server_poll_loop())
     bkp_task = asyncio.create_task(_backup_loop())
+
+    try:
+        await _apply_admin_reset_from_env()
+    except Exception as e:  # never block startup because of recovery
+        print(f"[admin-reset] failed: {type(e).__name__}: {e}")
 
     db = await store.get()
     xray_manager.generate_xray_config(
