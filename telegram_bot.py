@@ -283,6 +283,72 @@ def resolve_creds(settings: dict):
             str(s.get("telegram_chat_id") or "").strip(), "db")
 
 
+# ---------------------------- command menu (setMyCommands) --------------------
+# Customer-side command list shown when the user taps "/" in Telegram.
+CUSTOMER_COMMANDS = [
+    ("start", "شروع / منوی اصلی"),
+    ("menu", "منوی اصلی"),
+    ("services", "سرویس‌های من"),
+    ("usage", "مصرف من"),
+    ("wallet", "کیف پول"),
+    ("referral", "زیرمجموعه‌گیری"),
+    ("wheel", "گردونه شانس"),
+    ("support", "پشتیبانی"),
+    ("help", "راهنما"),
+]
+
+# Admin-side list (registered per-chat for the admin chat id only).
+ADMIN_COMMANDS = [
+    ("stats", "آمار پنل"),
+    ("users", "لیست کاربران"),
+    ("user", "جزئیات کاربر: /user <name>"),
+    ("sub", "لینک ساب + QR: /sub <name>"),
+    ("create", "ساخت کاربر: /create <name> [GB] [days]"),
+    ("reset", "ریست مصرف: /reset <name>"),
+    ("delete", "حذف کاربر: /delete <name>"),
+    ("best", "سنجش سرورها"),
+    ("risk", "کاربران در خطر"),
+    ("conns", "اتصالات زنده"),
+    ("broadcast", "پیام همگانی"),
+    ("backup", "پشتیبان‌گیری"),
+    ("cancel", "لغو عملیات"),
+]
+
+
+async def register_commands(token: str, admin_chat=None) -> dict:
+    """Publish the bot command menu to Telegram.
+
+    - Customer list is set as the default (scope: all private chats).
+    - Admin list is set as a per-chat scope for admin_chat, so only the admin
+      sees the management commands when typing '/'.
+    Idempotent: safe to call on every boot / every save.
+    """
+    result = {"customer": False, "admin": False, "error": ""}
+    if not token:
+        result["error"] = "no-token"
+        return result
+    payload = {"commands": [{"command": c, "description": d} for c, d in CUSTOMER_COMMANDS]}
+    data = await tg_call(token, "setMyCommands", payload)
+    if not (isinstance(data, dict) and data.get("ok")):
+        result["error"] = str(
+            (data or {}).get("description") if isinstance(data, dict) else "failed"
+        )[:200]
+        return result
+    result["customer"] = True
+    if admin_chat:
+        try:
+            scope = {"type": "chat", "chat_id": int(admin_chat)}
+        except Exception:
+            scope = None
+        if scope:
+            data2 = await tg_call(token, "setMyCommands", {
+                "commands": [{"command": c, "description": d} for c, d in ADMIN_COMMANDS],
+                "scope": scope,
+            })
+            result["admin"] = bool(isinstance(data2, dict) and data2.get("ok"))
+    return result
+
+
 def _shop_cfg(db) -> dict:
     s = db.get("settings") or {}
     token, admin_chat, _src = resolve_creds(s)
@@ -1693,6 +1759,14 @@ async def poll_loop(store, get_token_chat, interval: float = 2.5):
 
                 if is_admin:
                     if text.startswith("/"):
+                        if text.split()[0].split("@")[0].lower() == "/start":
+                            # Welcome the admin and re-publish the command menu
+                            # (covers the case where the token was saved before
+                            # command registration existed).
+                            try:
+                                await register_commands(token, chat)
+                            except Exception as e:
+                                log.warning("register_commands(admin) error: %s", e)
                         await _handle_admin_command(store, token, chat, text)
                         continue
                     if await handle_shop_message(store, token, chat, tg_user, text, is_admin=True):

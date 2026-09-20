@@ -715,6 +715,15 @@ async def _telegram_poll_loop():
         s = (db.get("settings") or {})
         token, chat, _src = telegram_bot.resolve_creds(s)
         return (token, chat, bool(s.get("telegram_enabled")))
+    # Publish the command menu once on boot so the "/" list is never empty,
+    # even if the token was saved before command registration existed.
+    try:
+        _t, _c, _en = _creds()
+        if _t and _en:
+            state = await telegram_bot.register_commands(_t, _c)
+            print(f"[telegram] command menu: {state}")
+    except Exception as e:
+        print(f"[telegram] command registration failed: {type(e).__name__}: {e}")
     try:
         await telegram_bot.poll_loop(store, _creds)
     except asyncio.CancelledError:
@@ -2270,7 +2279,14 @@ async def api_tg_save(request: Request, user: str = Depends(require_perm("telegr
         await store.mutate(_bn)
     except Exception:
         pass
-    return {"ok": True, "bot_username": bot_name}
+    # Publish the bot command menu so "/" in Telegram shows the commands.
+    cmd_state = {}
+    if token:
+        try:
+            cmd_state = await telegram_bot.register_commands(token, chat_id)
+        except Exception as e:
+            cmd_state = {"error": f"{type(e).__name__}: {e}"[:200]}
+    return {"ok": True, "bot_username": bot_name, "commands": cmd_state}
 
 
 @app.post("/api/telegram/test")
