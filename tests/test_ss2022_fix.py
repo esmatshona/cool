@@ -17,11 +17,22 @@ import xray_manager as xm
 
 # --------------------------------------------------------------- key helpers
 def test_2022_key_is_base64_of_exact_length():
-    for method, nbytes in xm.SS2022_KEY_BYTES.items():
+    # The Go implementation accepts 32-byte keys for every SS2022 cipher, so
+    # make_ss_key standardises on 32 bytes.
+    for method in xm.SS2022_METHODS:
         key = xm.make_ss_key(method)
         raw = base64.b64decode(key, validate=True)
-        assert len(raw) == nbytes, f"{method} produced {len(raw)} bytes"
+        assert len(raw) == 32, f"{method} produced {len(raw)} bytes"
         assert xm.ss_key_is_valid(method, key)
+
+
+def test_native_key_sizes_also_validate():
+    """Hand-written configs from the Xray docs use 16 bytes for aes-128."""
+    k16 = base64.b64encode(secrets.token_bytes(16)).decode()
+    k32 = base64.b64encode(secrets.token_bytes(32)).decode()
+    assert xm.ss_key_is_valid("2022-blake3-aes-128-gcm", k16)
+    assert xm.ss_key_is_valid("2022-blake3-aes-128-gcm", k32)
+    assert xm.ss_key_is_valid("2022-blake3-aes-256-gcm", k32)
 
 
 def test_key_randomness():
@@ -38,15 +49,30 @@ def test_the_original_broken_style_is_rejected():
             f"{bad!r} must be rejected as a 2022-blake3 psk")
 
 
+def test_server_user_pair_format():
+    """SS2022 multi-user clients authenticate as ServerPSK:UserPSK."""
+    server = xm.make_server_psk()
+    user = xm.make_ss_key("2022-blake3-aes-128-gcm")
+    pair = xm.ss_client_password(server, user)
+    assert pair == f"{server}:{user}"
+    assert xm.ss_key_is_valid("2022-blake3-aes-128-gcm", pair)
+    # both halves are real PSKs
+    for half in pair.split(":"):
+        assert len(base64.b64decode(half, validate=True)) == 32
+    # a single user psk alone is also valid
+    assert xm.ss_key_is_valid("2022-blake3-aes-128-gcm", user)
+
+
+def test_ss_client_password_without_server_psk():
+    user = xm.make_ss_key("2022-blake3-aes-128-gcm")
+    assert xm.ss_client_password(None, user) == user
+    assert xm.ss_client_password("", user) == user
+
+
 def test_wrong_length_base64_is_rejected():
-    # valid base64, but 12/31/64 bytes instead of the required 16
-    for n in (12, 15, 17, 31, 64):
+    for n in (1, 12, 15, 17, 31, 64):
         k = base64.b64encode(secrets.token_bytes(n)).decode()
-        assert not xm.ss_key_is_valid("2022-blake3-aes-128-gcm", k)
-    # 32 bytes is right for aes-256 but wrong for aes-128
-    k32 = base64.b64encode(secrets.token_bytes(32)).decode()
-    assert xm.ss_key_is_valid("2022-blake3-aes-256-gcm", k32)
-    assert not xm.ss_key_is_valid("2022-blake3-aes-128-gcm", k32)
+        assert not xm.ss_key_is_valid("2022-blake3-aes-128-gcm", k), n
 
 
 def test_legacy_ciphers_accept_text_passwords():
@@ -57,6 +83,7 @@ def test_legacy_ciphers_accept_text_passwords():
 def test_is_ss2022():
     assert xm.is_ss2022("2022-blake3-aes-128-gcm")
     assert xm.is_ss2022("2022-blake3-aes-256-gcm")
+    assert xm.is_ss2022("2022-blake3-chacha20-poly1305")
     assert not xm.is_ss2022("aes-256-gcm")
     assert not xm.is_ss2022("")
     assert not xm.is_ss2022(None)
@@ -107,20 +134,44 @@ def test_generated_config_is_self_consistent(cfg_path):
     assert cfg is not None, "generate_xray_config must return the config"
     ss = [i for i in cfg["inbounds"] if i["protocol"] == "shadowsocks"]
     assert len(ss) == 1
-    method = ss[0]["settings"]["method"]
-    for cl in ss[0]["settings"]["clients"]:
-        assert xm.ss_key_is_valid(method, cl["password"]), "bad psk emitted"
-    assert xm.validate_config()["ok"] is True
+    s = ss[0]["settings"]
+    assert s["method"] in xm.SS2022_METHODS
+    # SS2022 multi-user REQUIRES a server psk on the inbound...
+    assert s.get("password"), "ss2022 inbound must carry a server psk"
+    assert len(base64.b64decode(s["password"], validate=True)) == 32
+    # ...and each client keeps its own (single) user psk
+    assert s["clients"], "inbound must list clients"
+    for cl in s["clients"]:
+        assert ":" not in cl["password"], "clients hold the raw user psk"
+        assert xm.ss_key_is_valid(s["method"], cl["password"])
+    assert xm.validate_config()["ok"] is True, xm.validate_config()
+
+
+def test_server_psk_is_recorded_for_link_builders(cfg_path):
+    xm.generate_xray_config([_ib()])
+    psk = xm.current_ss_server_psk()
+    assert psk and len(base64.b64decode(psk, validate=True)) == 32
+
+
+def test_client_password_pair_matches_the_server_psk(cfg_path):
+    """The link a user gets must be accepted by the running inbound."""
+    ib = _ib()
+    cfg = xm.generate_xray_config([ib])
+    server = cfg["inbounds"][-1]["settings"]["password"]
+    user = cfg["inbounds"][-1]["settings"]["clients"][0]["password"]
+    pair = xm.ss_client_password(server, user)
+    assert pair.startswith(server + ":")
+    assert xm.ss_key_is_valid(ib["ss_method"], pair)
 
 
 def test_broken_key_is_repaired_at_config_build_time(cfg_path):
     """Even a db full of legacy broken keys must produce a bootable config."""
     ib = _ib(ss_password=secrets.token_hex(12))  # the exact old production value
     cfg = xm.generate_xray_config([ib])
-    ss = cfg["inbounds"][-1]
+    ss = [i for i in cfg["inbounds"] if i["protocol"] == "shadowsocks"][0]
     assert xm.ss_key_is_valid(ss["settings"]["method"],
                               ss["settings"]["clients"][0]["password"])
-    assert xm.validate_config()["ok"] is True
+    assert xm.validate_config()["ok"] is True, xm.validate_config()
 
 
 def test_no_ss_users_means_no_ss_inbound(cfg_path):
@@ -156,7 +207,18 @@ def test_validator_catches_a_bad_psk(cfg_path):
     cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
     res = xm.validate_config()
     assert res["ok"] is False
-    assert any("psk" in e for e in res["errors"])
+    assert any("psk" in e for e in res["errors"]), res["errors"]
+
+
+def test_validator_catches_a_missing_server_psk(cfg_path):
+    """This was the real 'missing key' crash — the inbound had no password."""
+    cfg = xm.generate_xray_config([_ib()])
+    cfg["inbounds"][-1]["settings"].pop("password", None)
+    import json
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    res = xm.validate_config()
+    assert res["ok"] is False
+    assert any("server psk" in e for e in res["errors"]), res["errors"]
 
 
 def test_validator_accepts_trojan_password_clients(cfg_path):

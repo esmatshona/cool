@@ -3144,7 +3144,12 @@ def build_links(request: Request, db, ib) -> dict:
     if "shadowsocks" in protos:
         ss_method = (ib.get("ss_method") or xray_manager.SS_METHOD)
         ss_pw = xray_manager.repair_ss_key(ib, ss_method)
-        userinfo = base64.urlsafe_b64encode(f"{ss_method}:{ss_pw}".encode()).decode().rstrip("=")
+        # SS2022 clients authenticate with "ServerPSK:UserPSK".
+        link_pw = ss_pw
+        if xray_manager.is_ss2022(ss_method):
+            link_pw = xray_manager.ss_client_password(
+                xray_manager.current_ss_server_psk(), ss_pw)
+        userinfo = base64.urlsafe_b64encode(f"{ss_method}:{link_pw}".encode()).decode().rstrip("=")
         all_links.append(f"ss://{userinfo}@{host}:{SS_PORT}#{quote(remark('shadowsocks', 'TCP'))}")
 
     # The first VLESS link is the canonical one the UI calls "tls".
@@ -3224,9 +3229,13 @@ def build_clash_yaml(request: Request, db, ib) -> str:
     if "shadowsocks" in protos:
         ss_method = ib.get("ss_method") or xray_manager.SS_METHOD
         ss_pw = xray_manager.repair_ss_key(ib, ss_method)
+        clash_pw = ss_pw
+        if xray_manager.is_ss2022(ss_method):
+            clash_pw = xray_manager.ss_client_password(
+                xray_manager.current_ss_server_psk(), ss_pw)
         n = f"{prefix}-{name}-SS-TCP"
         add(n, ["type: ss", f"server: {host}", f"port: {SS_PORT}",
-                f"cipher: {ss_method}", f"password: \"{ss_pw}\"", "udp: true"])
+                f"cipher: {ss_method}", f"password: \"{clash_pw}\"", "udp: true"])
 
     if not proxies:
         proxies = ["  - name: \"DIRECT-ONLY\"\n    type: direct"]
@@ -3282,10 +3291,14 @@ def build_singbox_config(request: Request, db, ib) -> dict:
     if "shadowsocks" in protos:
         t = f"{prefix}-{name}-SS-TCP"
         _ss_method = ib.get("ss_method") or xray_manager.SS_METHOD
+        _ss_user = xray_manager.repair_ss_key(ib, _ss_method)
+        if xray_manager.is_ss2022(_ss_method):
+            _ss_user = xray_manager.ss_client_password(
+                xray_manager.current_ss_server_psk(), _ss_user)
         outs.append({"type": "shadowsocks", "tag": t, "server": host,
                      "server_port": SS_PORT,
                      "method": _ss_method,
-                     "password": xray_manager.repair_ss_key(ib, _ss_method)})
+                     "password": _ss_user})
         tags.append(t)
 
     outs.append({"type": "direct", "tag": "direct"})

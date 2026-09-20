@@ -22,11 +22,19 @@ SS_METHOD = os.environ.get("SS_METHOD", "2022-blake3-aes-128-gcm")
 # a random text password (e.g. token_hex(12)) makes the proxy fail with
 # "missing psk" and — because that aborts the whole server — takes EVERY other
 # protocol down with it. These helpers guarantee a byte-correct key.
+#
+# Per the Xray docs, the Go implementation always accepts a 32-byte key, so we
+# mint 32 bytes for every SS2022 cipher (32 is also the only size that works
+# for chacha20-poly1305).
 SS2022_KEY_BYTES = {
     "2022-blake3-aes-128-gcm": 16,
     "2022-blake3-aes-256-gcm": 32,
+    "2022-blake3-chacha20-poly1305": 32,
 }
 SS2022_METHODS = tuple(SS2022_KEY_BYTES)
+# The Go implementation accepts 32-byte keys for all of the above, which keeps
+# a single key valid across every SS2022 cipher we support.
+SS2022_DEFAULT_BYTES = 32
 # Legacy AEAD ciphers accept an arbitrary text password, so one fixed length
 # works for all of them.
 SS_LEGACY_KEY_CHARS = 24
@@ -39,25 +47,40 @@ def is_ss2022(method: str) -> bool:
 def make_ss_key(method: str) -> str:
     """Return a cipher-correct Shadowsocks password for `method`.
 
-    - 2022-blake3-* -> base64 of exactly 16/32 random bytes (a real PSK)
+    - 2022-blake3-* -> base64 of 32 random bytes (valid for every SS2022 cipher
+      in the Go implementation, which is what the panel runs)
     - anything else -> a random 24-char text password (AEAD style)
     """
     if is_ss2022(method):
-        return base64.b64encode(secrets.token_bytes(SS2022_KEY_BYTES[method])).decode()
+        return base64.b64encode(secrets.token_bytes(SS2022_DEFAULT_BYTES)).decode()
     return secrets.token_urlsafe(32)[:SS_LEGACY_KEY_CHARS]
 
 
 def ss_key_is_valid(method: str, password) -> bool:
-    """True when `password` can actually be used with `method`."""
+    """True when `password` can actually be used with `method`.
+
+    SS2022 requires base64 of 32 bytes (the Go implementation accepts 32 for
+    every 2022 cipher) — anything shorter or non-base64 makes xray abort.
+    """
     if not password or not isinstance(password, str):
         return False
     if not is_ss2022(method):
         return True
+    # Client passwords in multi-user mode are "ServerPSK:UserPSK".
+    if ":" in password:
+        server, _, user = password.partition(":")
+        return _psk_ok(server) and _psk_ok(user)
+    return _psk_ok(password)
+
+
+def _psk_ok(psk: str) -> bool:
     try:
-        raw = base64.b64decode(password, validate=True)
+        raw = base64.b64decode(psk, validate=True)
     except Exception:
         return False
-    return len(raw) == SS2022_KEY_BYTES[method]
+    # 32 is universally accepted; also allow the cipher's native size so
+    # hand-written configs from the Xray docs keep validating.
+    return len(raw) in (16, 32)
 
 
 def repair_ss_key(ib: dict, method: str) -> str:
@@ -68,16 +91,38 @@ def repair_ss_key(ib: dict, method: str) -> str:
     all, so a fresh one is strictly better than a dead engine.
     """
     current = ib.get("ss_password")
-    if ss_key_is_valid(method, current):
+    if ss_key_is_valid(method, current) and ":" not in (current or ""):
         return current
     key = make_ss_key(method)
     ib["ss_password"] = key
     return key
 
 
-async def ss_key_needs_refresh(method: str, password) -> bool:
-    """Async wrapper used by callers that prefer the manager API."""
-    return not ss_key_is_valid(method, password)
+def make_server_psk() -> str:
+    """Inbound-level server PSK (required by SS2022 multi-user mode)."""
+    return base64.b64encode(secrets.token_bytes(SS2022_DEFAULT_BYTES)).decode()
+
+
+def ss_client_password(server_psk, user_psk: str) -> str:
+    """SS2022 clients authenticate as "ServerPSK:UserPSK" (Xray docs)."""
+    if not server_psk:
+        return user_psk
+    return f"{server_psk}:{user_psk}"
+
+
+# Persisted copy of the live server PSK so subscription/link builders emit
+# exactly the creds xray is actually serving. Written by generate_xray_config.
+_live_ss_server_psk = None
+
+
+def current_ss_server_psk():
+    """The server PSK in the currently generated config (or None)."""
+    return _live_ss_server_psk
+
+
+def _remember_ss_server_psk(psk):
+    global _live_ss_server_psk
+    _live_ss_server_psk = psk
 
 
 # Access log: source of per-user IPs + last-connection times.
@@ -194,7 +239,7 @@ def generate_xray_config(inbounds_data, log_level="warning", ip_blocklist=None):
         },
     ]
     if clients_ss:
-        # One SS inbound can only carry ONE cipher, so group clients by method.
+        # One SS inbound carries ONE cipher, so group clients by method.
         # (Mixing methods in a single inbound is another fatal-start case.)
         by_method = {}
         for cl in clients_ss:
@@ -202,15 +247,24 @@ def generate_xray_config(inbounds_data, log_level="warning", ip_blocklist=None):
                 {"password": cl["password"], "email": cl["email"]})
         first = True
         for i, (method, cls) in enumerate(sorted(by_method.items())):
+            settings = {
+                "method": method,
+                "network": "tcp,udp",
+                "clients": cls,
+            }
+            if is_ss2022(method):
+                # SS2022 multi-user mode REQUIRES an inbound-level server PSK
+                # (xray aborts with "missing key" without it). Per the official
+                # example the clients keep their own user PSK here, while the
+                # *client* link uses "ServerPSK:UserPSK".
+                server_psk = make_server_psk()
+                settings["password"] = server_psk
+                _remember_ss_server_psk(server_psk)
             inbounds.append({
                 "listen": "0.0.0.0",
                 "port": SS_PORT if first else SS_PORT + i,
                 "protocol": "shadowsocks",
-                "settings": {
-                    "clients": cls,
-                    "method": method,
-                    "network": "tcp,udp",
-                },
+                "settings": settings,
                 "tag": "inbound-ss" if first else f"inbound-ss-{i}",
             })
             first = False
@@ -343,20 +397,31 @@ def validate_config() -> dict:
         else:
             tags.add(ib["tag"])
         settings = ib.get("settings") or {}
-        cls = settings.get("clients", [])
         proto = ib.get("protocol")
+        cls = settings.get("clients", [])
         if proto == "shadowsocks":
-            # SS clients carry password+email (no `id`), and 2022-blake3 needs
-            # a base64 PSK of exactly the cipher's key length or Xray dies.
+            # SS clients carry password+email (no `id`). 2022-blake3 additionally
+            # needs an inbound-level server PSK, and getting this wrong makes
+            # xray refuse to start at all ("missing psk" / "missing key").
             method = settings.get("method") or ""
-            if not cls:
+            users = settings.get("clients") or settings.get("users") or []
+            if not users:
                 errors.append(f"shadowsocks inbound {ib.get('tag')} has no clients")
-            for cl in cls:
-                if not cl.get("password"):
-                    errors.append(f"ss client without password in {ib.get('tag')}")
-                elif not ss_key_is_valid(method, cl.get("password")):
+            if is_ss2022(method):
+                server = settings.get("password")
+                if not server:
                     errors.append(
-                        f"invalid {method} psk for {cl.get('email')} in {ib.get('tag')}")
+                        f"ss2022 inbound {ib.get('tag')} missing server psk")
+                elif not _psk_ok(server):
+                    errors.append(
+                        f"ss2022 inbound {ib.get('tag')} has an invalid server psk")
+            for u in users:
+                pw = u.get("password") or ""
+                if not pw:
+                    errors.append(f"ss client without password in {ib.get('tag')}")
+                elif is_ss2022(method) and not _psk_ok(pw.split(":")[-1]):
+                    errors.append(
+                        f"invalid ss2022 user psk for {u.get('email')}")
         elif proto == "trojan":
             # Trojan authenticates with a password, not a UUID.
             for cl in cls:
